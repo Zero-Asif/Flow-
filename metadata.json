@@ -1,0 +1,6 @@
+{
+  "name": "Flow",
+  "description": "Audiophile Deezer-inspired lossless music player featuring a worldwide search engine for all songs in the world, Flow recommendations, gapless FLAC/ALAC playback, 10-band equalizer, and offline storage.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

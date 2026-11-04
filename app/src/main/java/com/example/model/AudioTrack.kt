@@ -39,7 +39,8 @@ data class AudioTrack(
     val fileSizeFormatted: String = "32.4 MB",
     val isDownloaded: Boolean = false,
     val localFilePath: String? = null,
-    val sourceProvider: String = "Flow Lossless"
+    val sourceProvider: String = "Flow Lossless",
+    val isrc: String? = null
 ) {
     val isOfflineAvailable: Boolean
         get() = isDownloaded || isLocalImport || !localFilePath.isNullOrBlank()

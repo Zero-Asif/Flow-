@@ -22,6 +22,74 @@ import java.io.FileOutputStream
 object AlbumArtHelper {
 
     private const val ARTWORK_SIZE = 512
+    private val enhancedUrlCache = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    /**
+     * Module 4: Dynamic High-Resolution Cover Art URL Enhancer:
+     * - Deezer: Replaces /56x56-, /100x100-, /250x250-, or /500x500- with /1000x1000-000000-80-0-0.jpg
+     * - Amazon Music / Apple: Strips downscaled sizing parameters (._SX300_, ._AC_UL320_) -> ._UL1500_ and 1000x1000bb
+     * - YouTube Music: Replaces =w60-h60 / =w120-h120 with =w1080-h1080-l95-rj or maxresdefault.jpg
+     * - JioSaavn: Replaces 50x50 / 150x150 with 500x500
+     */
+    fun enhanceArtworkUrl(rawUrl: String?): String {
+        if (rawUrl.isNullOrBlank()) return ""
+        val trimmed = rawUrl.trim()
+        enhancedUrlCache[trimmed]?.let { return it }
+
+        var upgraded = trimmed
+
+        // 1. Deezer CDN (dzcdn.net / deezer.com)
+        if (upgraded.contains("dzcdn.net", ignoreCase = true) || upgraded.contains("deezer.com", ignoreCase = true)) {
+            upgraded = upgraded
+                .replace(Regex("""/\d+x\d+-[0-9a-fA-F-]+-\d+-\d+-\d+\.(jpg|png)"""), "/1000x1000-000000-80-0-0.jpg")
+                .replace("/56x56-", "/1000x1000-")
+                .replace("/100x100-", "/1000x1000-")
+                .replace("/250x250-", "/1000x1000-")
+                .replace("/500x500-", "/1000x1000-")
+        }
+
+        // 2. Amazon Music / Amazon CDN (m.media-amazon.com / images-na.ssl-images-amazon.com)
+        if (upgraded.contains("amazon.com", ignoreCase = true) ||
+            upgraded.contains("ssl-images-amazon", ignoreCase = true) ||
+            upgraded.contains("._SX", ignoreCase = true) ||
+            upgraded.contains("._SY", ignoreCase = true) ||
+            upgraded.contains("._AC_UL", ignoreCase = true) ||
+            upgraded.contains("._SS", ignoreCase = true)
+        ) {
+            upgraded = upgraded.replace(
+                Regex("""\._(SX\d+|SY\d+|SS\d+|AC_UL\d+|AC_SL\d+|UL\d+|UX\d+|UY\d+|SR\d+,\d+)_"""),
+                "._UL1500_"
+            )
+        }
+
+        // 3. Apple / iTunes / Tidal CDN (mzstatic.com)
+        if (upgraded.contains("mzstatic.com", ignoreCase = true) || upgraded.contains("100x100bb") || upgraded.contains("600x600bb")) {
+            upgraded = upgraded
+                .replace(Regex("""\d+x\d+bb"""), "1000x1000bb")
+        }
+
+        // 4. YouTube Music / GoogleUserContent / ytimg
+        if (upgraded.contains("googleusercontent.com", ignoreCase = true) || upgraded.contains("ggpht.com", ignoreCase = true)) {
+            upgraded = upgraded.replace(Regex("""=w\d+-h\d+[^&?\s]*"""), "=w1080-h1080-l95-rj")
+        } else if (upgraded.contains("ytimg.com", ignoreCase = true)) {
+            upgraded = upgraded
+                .replace("hqdefault.jpg", "maxresdefault.jpg")
+                .replace("mqdefault.jpg", "maxresdefault.jpg")
+                .replace("sddefault.jpg", "maxresdefault.jpg")
+        }
+
+        // 5. JioSaavn CDN (saavncdn.com)
+        if (upgraded.contains("saavncdn.com", ignoreCase = true) || upgraded.contains("150x150") || upgraded.contains("50x50")) {
+            upgraded = upgraded
+                .replace("50x50.jpg", "500x500.jpg")
+                .replace("150x150.jpg", "500x500.jpg")
+                .replace("50x50", "500x500")
+                .replace("150x150", "500x500")
+        }
+
+        enhancedUrlCache[trimmed] = upgraded
+        return upgraded
+    }
 
     fun getArtworkBitmap(context: Context, track: AudioTrack): Bitmap {
         val cacheDir = File(context.cacheDir, "album_art")

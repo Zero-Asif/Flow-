@@ -13,6 +13,7 @@ import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
+import androidx.compose.foundation.basicMarquee
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -118,11 +119,13 @@ fun NowPlayingSheet(
     audioQualityInfo: AudioQualityInfo = AudioQualityInfo(),
     badgeDisplayMode: BadgeDisplayMode = BadgeDisplayMode.AUDIOPHILE_FULL,
     streamBackend: StreamBackend = StreamBackend.AUTO_HIGH_FIDELITY,
+    activeStreamCandidateName: String? = null,
     lyrics: List<KaraokeLyricLine> = emptyList(),
     lyricsSyncState: LyricsSyncState = LyricsSyncState(),
     lyricsDisplayMode: LyricsDisplayMode = LyricsDisplayMode.LINE_GLOW,
     onCycleBadgeMode: () -> Unit = {},
     onCycleStreamBackend: () -> Unit = {},
+    onCycleStreamCandidate: () -> Unit = onCycleStreamBackend,
     onCycleLyricsMode: () -> Unit = {},
     onTogglePlay: () -> Unit,
     onNext: () -> Unit,
@@ -261,7 +264,10 @@ fun NowPlayingSheet(
 
             Spacer(modifier = Modifier.height(6.dp))
 
-            // Full Song Stream Provider Badge (Click to cycle backends: Auto, Piped, Invidious, Local)
+            // Full Song Stream Provider Badge (Click to cycle real stream candidates: [Deezer HiFi FLAC], [Amazon Ultra HD], [Tidal Master], [JioSaavn 320k])
+            val displayedStream = activeStreamCandidateName?.takeIf { it.isNotBlank() }
+                ?: track.sourceProvider.takeIf { it.isNotBlank() }
+                ?: streamBackend.label
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.Center,
@@ -269,12 +275,12 @@ fun NowPlayingSheet(
                     .clip(RoundedCornerShape(12.dp))
                     .background(DeezerPurplePrimary.copy(alpha = 0.25f))
                     .border(0.8.dp, DeezerPinkAccent.copy(alpha = 0.45f), RoundedCornerShape(12.dp))
-                    .clickable { onCycleStreamBackend() }
+                    .clickable { onCycleStreamCandidate() }
                     .padding(horizontal = 10.dp, vertical = 3.dp)
                     .testTag("stream_backend_badge")
             ) {
                 Text(
-                    text = "Stream: ${streamBackend.label}",
+                    text = "Stream: [$displayedStream]",
                     fontSize = 10.sp,
                     fontWeight = FontWeight.SemiBold,
                     color = TextPrimaryDark
@@ -408,7 +414,15 @@ fun NowPlayingSheet(
                             color = TextPrimaryDark
                         ),
                         maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .basicMarquee(
+                                iterations = Int.MAX_VALUE,
+                                initialDelayMillis = 1500,
+                                repeatDelayMillis = 1500,
+                                velocity = 30.dp
+                            )
                     )
                     Text(
                         text = "${track.artist} — ${track.genre} (${track.releaseYear})",
@@ -416,7 +430,15 @@ fun NowPlayingSheet(
                             color = TextSecondaryDark
                         ),
                         maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .basicMarquee(
+                                iterations = Int.MAX_VALUE,
+                                initialDelayMillis = 1500,
+                                repeatDelayMillis = 1500,
+                                velocity = 30.dp
+                            )
                     )
                 }
 

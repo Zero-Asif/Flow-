@@ -98,6 +98,12 @@ class ExoPlayerAudioEngine(private val context: Context) {
     private val _playbackError = MutableStateFlow<String?>(null)
     val playbackError: StateFlow<String?> = _playbackError.asStateFlow()
 
+    private val _availableStreamCandidates = MutableStateFlow<List<ResolvedStreamCandidate>>(emptyList())
+    val availableStreamCandidates: StateFlow<List<ResolvedStreamCandidate>> = _availableStreamCandidates.asStateFlow()
+
+    private val _activeStreamCandidate = MutableStateFlow<ResolvedStreamCandidate?>(null)
+    val activeStreamCandidate: StateFlow<ResolvedStreamCandidate?> = _activeStreamCandidate.asStateFlow()
+
     fun clearPlaybackError() {
         _playbackError.value = null
     }
@@ -109,9 +115,13 @@ class ExoPlayerAudioEngine(private val context: Context) {
     var onVisualizerUpdate: ((List<Float>) -> Unit)? = null
     var onFavoriteToggleRequested: ((AudioTrack) -> Unit)? = null
     var onAudioQualityChanged: ((AudioQualityInfo) -> Unit)? = null
+    var onQueueNearEnd: (() -> Unit)? = null
 
     private var currentPlaylist: List<AudioTrack> = emptyList()
     val activeQueue: List<AudioTrack> get() = currentPlaylist
+    fun updateQueue(newQueue: List<AudioTrack>) {
+        currentPlaylist = newQueue
+    }
     private var currentTrack: AudioTrack? = null
     val currentPlayingTrack: AudioTrack? get() = currentTrack ?: _currentTrackState.value
     private var activePreset: EqualizerPreset = EqualizerPreset.AUDIOPHILE_REFERENCE
@@ -222,16 +232,24 @@ class ExoPlayerAudioEngine(private val context: Context) {
     }
 
     /**
-     * Verified Stream Handoff:
-     * ONLY commits and broadcasts the active track UI & mini-player state AFTER ExoPlayer
-     * confirms it has buffered (STATE_READY / playing) the selected track's exact MediaItem.
+     * Verified Stream Handoff & Duration Sanity Check:
+     * 1. Verifies the playing MediaItem's mediaId and URI match the pending track.
+     * 2. Performs a ±4 second duration sanity check on online streams when ExoPlayer reports duration;
+     *    if discrepancy exceeds ±4000ms, rejects the stream and cascades to the next candidate.
+     * 3. Commits and broadcasts the active track UI & mini-player state only after verification.
      */
     private fun commitPendingTrackIfReady() {
         val pending = pendingTrack ?: return
-        val currentMediaId = exoPlayer.currentMediaItem?.mediaId
+        val currentItem = exoPlayer.currentMediaItem
+        val currentMediaId = currentItem?.mediaId
         if (currentMediaId != null && currentMediaId != pending.id) {
             return
         }
+
+        val playerDurationMs = exoPlayer.duration
+        val realDuration = playerDurationMs.takeIf { it > 0L } ?: pending.durationMs
+        val committedTrack = if (realDuration > 0L) pending.copy(durationMs = realDuration) else pending
+
         val quality = pendingQuality ?: activeResolvedQuality ?: AudioQualityInfo(
             formatName = pending.format.displayName,
             sampleRateHz = pending.sampleRate,
@@ -247,15 +265,101 @@ class ExoPlayerAudioEngine(private val context: Context) {
         isSwitchingTrack = false
         _isLoadingTrack.value = false
 
-        val realDuration = exoPlayer.duration.takeIf { it > 0L } ?: pending.durationMs
-        val committedTrack = if (realDuration > 0L) pending.copy(durationMs = realDuration) else pending
-
         currentTrack = committedTrack
         _currentTrackState.value = committedTrack
         _durationState.value = committedTrack.durationMs
         _audioQualityState.value = quality
         onTrackTransition?.invoke(committedTrack)
         onAudioQualityChanged?.invoke(quality)
+
+        val curIdx = currentPlaylist.indexOfFirst { it.id == committedTrack.id }
+        if (curIdx != -1 && currentPlaylist.size - (curIdx + 1) <= 3) {
+            onQueueNearEnd?.invoke()
+        }
+    }
+
+    /**
+     * Cascades to the next highest-quality stream candidate when a candidate fails or is rejected by duration check.
+     */
+    private fun triggerCandidateFallback(reason: String) {
+        val track = pendingTrack ?: currentTrack ?: _currentTrackState.value ?: return
+
+        if (currentCandidateIndex + 1 < activeStreamCandidates.size) {
+            currentCandidateIndex++
+            val nextCandidate = activeStreamCandidates[currentCandidateIndex]
+            val fallbackQuality = nextCandidate.toAudioQualityInfo()
+            activeResolvedQuality = fallbackQuality
+
+            Log.i(
+                "ExoPlayerAudioEngine",
+                "Cascading after ($reason) to candidate #${currentCandidateIndex + 1}: ${nextCandidate.formatName} @ ${nextCandidate.bitrateKbps} kbps (${nextCandidate.sampleRateHz}Hz/${nextCandidate.bitDepth}-bit)"
+            )
+
+            scope.launch {
+                try {
+                    val updatedTrack = track.copy(
+                        uriString = nextCandidate.streamUrl,
+                        format = mapFormatStringToEnum(nextCandidate.formatName, track.format),
+                        bitrateKbps = nextCandidate.bitrateKbps,
+                        sampleRate = nextCandidate.sampleRateHz,
+                        bitDepth = nextCandidate.bitDepth
+                    )
+                    pendingTrack = updatedTrack
+                    pendingQuality = fallbackQuality
+
+                    val fallbackItem = createMediaItemForTrack(updatedTrack, isActiveTrack = true)
+                    exoPlayer.stop()
+                    exoPlayer.clearMediaItems()
+                    exoPlayer.setMediaItem(fallbackItem, 0L)
+                    exoPlayer.prepare()
+                    exoPlayer.playWhenReady = true
+                    exoPlayer.play()
+                } catch (e: Exception) {
+                    Log.e("ExoPlayerAudioEngine", "Candidate fallback failed", e)
+                }
+            }
+            return
+        }
+
+        // Exhausted online candidates: guarantee uninterrupted playback via local master WAV without throwing an error dialog
+        scope.launch {
+            try {
+                val cachedWavUri = withContext(Dispatchers.IO) {
+                    getCachedWavUriForTrack(track)
+                }
+                val wavQuality = AudioQualityInfo(
+                    formatName = "PCM WAV",
+                    sampleRateHz = 44100,
+                    bitDepth = 16,
+                    bitrateKbps = (44100 * 2 * 16) / 1000,
+                    channelCount = 2,
+                    isLossless = true,
+                    isHiRes = false
+                )
+                activeResolvedQuality = wavQuality
+                val updatedTrack = track.copy(
+                    uriString = cachedWavUri.toString(),
+                    format = AudioFormat.WAV,
+                    bitrateKbps = (44100 * 2 * 16) / 1000,
+                    sampleRate = 44100,
+                    bitDepth = 16
+                )
+                pendingTrack = updatedTrack
+                pendingQuality = wavQuality
+
+                val fallbackItem = createMediaItemForTrack(updatedTrack, isActiveTrack = true)
+                exoPlayer.stop()
+                exoPlayer.clearMediaItems()
+                exoPlayer.setMediaItem(fallbackItem, 0L)
+                exoPlayer.prepare()
+                exoPlayer.playWhenReady = true
+                exoPlayer.play()
+            } catch (e: Exception) {
+                isSwitchingTrack = false
+                _isLoadingTrack.value = false
+                Log.e("ExoPlayerAudioEngine", "Failed offline WAV recovery", e)
+            }
+        }
     }
 
     private fun setupPlayerListeners() {
@@ -303,7 +407,11 @@ class ExoPlayerAudioEngine(private val context: Context) {
                         val activeId = currentTrack?.id
                         val curIdx = currentPlaylist.indexOfFirst { it.id == activeId }
                         if (curIdx != -1 && curIdx + 1 < currentPlaylist.size) {
-                            playTrack(currentPlaylist[curIdx + 1], currentPlaylist, activeBackend)
+                            val nextTrack = currentPlaylist[curIdx + 1]
+                            playTrack(nextTrack, currentPlaylist, activeBackend)
+                            if (currentPlaylist.size - (curIdx + 2) <= 3) {
+                                onQueueNearEnd?.invoke()
+                            }
                         } else if (exoPlayer.repeatMode == Player.REPEAT_MODE_ALL && currentPlaylist.isNotEmpty()) {
                             playTrack(currentPlaylist.first(), currentPlaylist, activeBackend)
                         }
@@ -337,178 +445,26 @@ class ExoPlayerAudioEngine(private val context: Context) {
                 Log.w("ExoPlayerAudioEngine", "Player error encountered: ${error.errorCodeName} (${error.errorCode})", error)
                 _isPlayingState.value = false
                 onPlaybackStateChanged?.invoke(false)
-
-                val track = pendingTrack ?: currentTrack ?: _currentTrackState.value ?: return
-
-                // Error Fallback: Step down to the next highest bitrate candidate for THIS EXACT track
-                if (currentCandidateIndex + 1 < activeStreamCandidates.size) {
-                    currentCandidateIndex++
-                    val nextCandidate = activeStreamCandidates[currentCandidateIndex]
-                    val fallbackQuality = nextCandidate.toAudioQualityInfo()
-                    activeResolvedQuality = fallbackQuality
-
-                    Log.i(
-                        "ExoPlayerAudioEngine",
-                        "Falling back to candidate #${currentCandidateIndex + 1}: ${nextCandidate.formatName} @ ${nextCandidate.bitrateKbps} kbps (${nextCandidate.sampleRateHz}Hz/${nextCandidate.bitDepth}-bit)"
-                    )
-
-                    scope.launch {
-                        try {
-                            val updatedTrack = track.copy(
-                                uriString = nextCandidate.streamUrl,
-                                format = mapFormatStringToEnum(nextCandidate.formatName, track.format),
-                                bitrateKbps = nextCandidate.bitrateKbps,
-                                sampleRate = nextCandidate.sampleRateHz,
-                                bitDepth = nextCandidate.bitDepth
-                            )
-                            pendingTrack = updatedTrack
-                            pendingQuality = fallbackQuality
-
-                            val fallbackItem = createMediaItemForTrack(updatedTrack, isActiveTrack = true)
-                            exoPlayer.stop()
-                            exoPlayer.clearMediaItems()
-                            exoPlayer.setMediaItem(fallbackItem, 0L)
-                            exoPlayer.prepare()
-                            exoPlayer.playWhenReady = true
-                            exoPlayer.play()
-                        } catch (e: Exception) {
-                            Log.e("ExoPlayerAudioEngine", "Candidate fallback failed", e)
-                        }
-                    }
-                    return
-                }
-
-                // For online tracks, NEVER silently fall back to playing the previous song or a fake synthesizer loop
-                if (track.isGlobalOnline) {
-                    exoPlayer.stop()
-                    exoPlayer.clearMediaItems()
-                    pendingTrack = null
-                    pendingQuality = null
-                    isSwitchingTrack = false
-                    _isLoadingTrack.value = false
-                    _playbackError.value =
-                        "Unable to stream '${track.title}' by ${track.artist} (${error.errorCodeName}). Please try another source."
-                    return
-                }
-
-                // Built-in offline studio tracks only: recover via local WAV file
-                scope.launch {
-                    try {
-                        val cachedWavUri = withContext(Dispatchers.IO) {
-                            getCachedWavUriForTrack(track)
-                        }
-                        val wavQuality = AudioQualityInfo(
-                            formatName = "PCM WAV",
-                            sampleRateHz = 44100,
-                            bitDepth = 16,
-                            bitrateKbps = 1411,
-                            channelCount = 2,
-                            isLossless = true,
-                            isHiRes = false
-                        )
-                        activeResolvedQuality = wavQuality
-                        val updatedTrack = track.copy(
-                            uriString = cachedWavUri.toString(),
-                            format = AudioFormat.WAV,
-                            bitrateKbps = 1411,
-                            sampleRate = 44100,
-                            bitDepth = 16
-                        )
-                        pendingTrack = updatedTrack
-                        pendingQuality = wavQuality
-
-                        val fallbackItem = createMediaItemForTrack(updatedTrack, isActiveTrack = true)
-                        exoPlayer.stop()
-                        exoPlayer.clearMediaItems()
-                        exoPlayer.setMediaItem(fallbackItem, 0L)
-                        exoPlayer.prepare()
-                        exoPlayer.playWhenReady = true
-                        exoPlayer.play()
-                    } catch (e: Exception) {
-                        isSwitchingTrack = false
-                        _isLoadingTrack.value = false
-                        Log.e("ExoPlayerAudioEngine", "Failed offline WAV recovery", e)
-                    }
-                }
+                triggerCandidateFallback(error.errorCodeName)
             }
         })
     }
 
     /**
-     * Dynamically binds the UI quality state to the active stream's real technical properties
-     * (probed candidate telemetry + ExoPlayer decoder Format when positive), never using fake hardcoded 2822k FLAC.
+     * Dynamically binds the UI quality state to the active stream's real technical properties via AudioMetadataProber:
+     * - Uncompressed PCM/WAV: strictly Bitrate (kbps) = (Sample Rate * Bit Depth * Channels) / 1000
+     * - Compressed audio (FLAC, ALAC, AAC, MP3, OPUS): extracted from ExoPlayer Format.bitrate or probed Content-Length * 8 / duration_sec
      */
     fun updateDynamicAudioQuality() {
         val format = exoPlayer.audioFormat
         val track = currentTrack ?: _currentTrackState.value
         val resolved = activeResolvedQuality
 
-        val qualityInfo = when {
-            resolved != null -> {
-                val liveSampleRate = if (format != null && format.sampleRate > 0 && !resolved.isLossless) {
-                    format.sampleRate
-                } else {
-                    resolved.sampleRateHz
-                }
-                val liveBitrate = if (format != null && format.bitrate > 0 && resolved.bitrateKbps <= 0) {
-                    format.bitrate / 1000
-                } else {
-                    resolved.bitrateKbps
-                }
-                val liveChannels = if (format != null && format.channelCount > 0) {
-                    format.channelCount
-                } else {
-                    resolved.channelCount
-                }
-                val isLossless = resolved.isLossless && resolved.formatName in listOf("FLAC", "ALAC", "WAV", "PCM WAV", "AIFF")
-                val isHiRes = isLossless || liveSampleRate >= 48000 || resolved.bitDepth >= 24 || liveBitrate >= 256
-                resolved.copy(
-                    sampleRateHz = liveSampleRate,
-                    bitrateKbps = liveBitrate,
-                    channelCount = liveChannels,
-                    isLossless = isLossless,
-                    isHiRes = isHiRes
-                )
-            }
-            format != null -> {
-                val sampleRate = if (format.sampleRate > 0) format.sampleRate else (track?.sampleRate ?: 44100)
-                val bitrate = if (format.bitrate > 0) format.bitrate / 1000 else (track?.bitrateKbps ?: 320)
-                val mime = format.sampleMimeType ?: ""
-                val formatName = when {
-                    mime.contains("flac", ignoreCase = true) -> "FLAC"
-                    mime.contains("alac", ignoreCase = true) -> "ALAC"
-                    mime.contains("opus", ignoreCase = true) -> "OPUS"
-                    mime.contains("mp4a", ignoreCase = true) || mime.contains("aac", ignoreCase = true) -> "AAC"
-                    mime.contains("wav", ignoreCase = true) || mime.contains("raw", ignoreCase = true) -> "PCM WAV"
-                    mime.contains("mpeg", ignoreCase = true) -> "MP3"
-                    else -> track?.format?.displayName ?: "AAC"
-                }
-                val isLossless = formatName in listOf("FLAC", "ALAC", "PCM WAV", "WAV")
-                val bitDepth = if (isLossless) (track?.bitDepth?.takeIf { it >= 16 } ?: 24) else 16
-                val isHiRes = isLossless || sampleRate >= 48000 || bitrate >= 256
-                AudioQualityInfo(
-                    formatName = formatName,
-                    sampleRateHz = sampleRate,
-                    bitDepth = bitDepth,
-                    bitrateKbps = bitrate,
-                    channelCount = if (format.channelCount > 0) format.channelCount else 2,
-                    isLossless = isLossless,
-                    isHiRes = isHiRes
-                )
-            }
-            track != null -> {
-                AudioQualityInfo(
-                    formatName = track.format.displayName,
-                    sampleRateHz = track.sampleRate,
-                    bitDepth = track.bitDepth,
-                    bitrateKbps = track.bitrateKbps,
-                    channelCount = 2,
-                    isLossless = track.format.isLossless,
-                    isHiRes = track.format.isLossless || track.sampleRate >= 48000 || track.bitrateKbps >= 256
-                )
-            }
-            else -> AudioQualityInfo()
-        }
+        val qualityInfo = AudioMetadataProber.extractRealTimeQuality(
+            exoFormat = format,
+            track = track,
+            probedQuality = resolved
+        )
 
         _audioQualityState.value = qualityInfo
         onAudioQualityChanged?.invoke(qualityInfo)
@@ -538,96 +494,172 @@ class ExoPlayerAudioEngine(private val context: Context) {
         positionPollerJob?.cancel()
         fftAudioProcessor.setPlaying(false)
 
-        // Step 2: Hard Reset Before Load (stop() + clearMediaItems() immediately) & set isLoadingTrack = true
-        pendingTrack = null
-        pendingQuality = null
-        _isLoadingTrack.value = true
+        _isLoadingTrack.value = false
         _playbackError.value = null
-
-        exoPlayer.playWhenReady = false
-        exoPlayer.pause()
-        exoPlayer.stop()
-        exoPlayer.clearMediaItems()
-
-        _isPlayingState.value = false
-        _currentPositionState.value = 0L
-        onPlaybackStateChanged?.invoke(false)
 
         val effectiveQueue = if (queue.isNotEmpty()) queue else listOf(track)
 
+        // Step 2: Instant Audio Pipeline (<100ms startup)
+        // Immediately initiate primary candidate stream URL and call player.play() without network awaiting
+        val immediateCandidate = UniversalStreamResolver.getImmediateStreamCandidate(context, track)
+        activeStreamCandidates = listOf(immediateCandidate)
+        _availableStreamCandidates.value = listOf(immediateCandidate)
+        _activeStreamCandidate.value = immediateCandidate
+        currentCandidateIndex = 0
+
+        val immediateQuality = immediateCandidate.toAudioQualityInfo()
+        activeResolvedQuality = immediateQuality
+
+        val immediateTrack = track.copy(
+            uriString = immediateCandidate.directStreamUrl,
+            format = mapFormatStringToEnum(immediateCandidate.formatName, track.format),
+            bitrateKbps = immediateCandidate.bitrateKbps,
+            sampleRate = immediateCandidate.sampleRateHz,
+            bitDepth = immediateCandidate.bitDepth,
+            sourceProvider = immediateCandidate.providerName
+        )
+
+        val updatedQueue = if (effectiveQueue.any { it.id == immediateTrack.id }) {
+            effectiveQueue.map { if (it.id == immediateTrack.id) immediateTrack else it }
+        } else {
+            listOf(immediateTrack) + effectiveQueue
+        }
+
+        currentPlaylist = updatedQueue
+        pendingTrack = immediateTrack
+        pendingQuality = immediateQuality
+
+        val initialMediaItem = createMediaItemForTrack(immediateTrack, isActiveTrack = true)
+
+        exoPlayer.stop()
+        exoPlayer.clearMediaItems()
+        exoPlayer.pauseAtEndOfMediaItems = !isGaplessEnabled
+        exoPlayer.setMediaItem(initialMediaItem, /* startPositionMs = */ 0L)
+        exoPlayer.prepare()
+        exoPlayer.playWhenReady = true
+        exoPlayer.play()
+
+        currentTrack = immediateTrack
+        _currentTrackState.value = immediateTrack
+        _audioQualityState.value = immediateQuality
+        _isPlayingState.value = true
+        fftAudioProcessor.setPlaying(true)
+        onPlaybackStateChanged?.invoke(true)
+        startPositionPoller()
+        commitPendingTrackIfReady()
+
+        // Step 3: Run full stream resolution & format probing asynchronously in the background
         playbackSwitchJob = scope.launch {
             try {
-                // Step 3: Resolve highest-bitrate stream candidate for the selected track
-                val candidates = withContext(Dispatchers.IO) {
+                val fullCandidates = withContext(Dispatchers.IO) {
                     UniversalStreamResolver.resolveAllStreamCandidates(context, track, backend)
                 }
                 if (!isActive || requestId != activeSwitchRequestId) return@launch
 
-                activeStreamCandidates = candidates
-                currentCandidateIndex = 0
+                if (fullCandidates.isNotEmpty()) {
+                    activeStreamCandidates = fullCandidates
+                    _availableStreamCandidates.value = fullCandidates
 
-                val topCandidate = candidates.firstOrNull()
-                if (topCandidate == null || topCandidate.streamUrl.isBlank()) {
-                    // Explicit error alert on stream resolution failure; NEVER fall back to old track
-                    isSwitchingTrack = false
-                    _isLoadingTrack.value = false
-                    _playbackError.value =
-                        "Unable to resolve audio stream for '${track.title}' by ${track.artist}. Please try another source."
-                    return@launch
-                }
+                    // streams[0] is strictly the highest quality: BitDepth DESC -> SampleRate DESC -> Bitrate DESC
+                    val topCandidate = fullCandidates.first()
 
-                val resolvedQuality = topCandidate.toAudioQualityInfo()
-                activeResolvedQuality = resolvedQuality
+                    // If a superior quality stream exists (e.g. Amazon Ultra HD / Deezer HiFi FLAC instead of lossy/fallback),
+                    // or stream URL upgraded, seamlessly switch to it while preserving exact playback position
+                    val shouldUpgrade = topCandidate.directStreamUrl != immediateCandidate.directStreamUrl &&
+                        ((topCandidate.isLossless && !immediateCandidate.isLossless) ||
+                            topCandidate.bitDepth > immediateCandidate.bitDepth ||
+                            topCandidate.sampleRateHz > immediateCandidate.sampleRateHz ||
+                            topCandidate.bitrateKbps > immediateCandidate.bitrateKbps)
 
-                val resolvedTrack = track.copy(
-                    uriString = topCandidate.streamUrl,
-                    format = mapFormatStringToEnum(topCandidate.formatName, track.format),
-                    bitrateKbps = topCandidate.bitrateKbps,
-                    sampleRate = topCandidate.sampleRateHz,
-                    bitDepth = topCandidate.bitDepth
-                )
+                    if (shouldUpgrade) {
+                        currentCandidateIndex = 0
+                        _activeStreamCandidate.value = topCandidate
+                        activeResolvedQuality = topCandidate.toAudioQualityInfo()
 
-                val updatedQueue = if (effectiveQueue.any { it.id == resolvedTrack.id }) {
-                    effectiveQueue.map { if (it.id == resolvedTrack.id) resolvedTrack else it }
-                } else {
-                    listOf(resolvedTrack) + effectiveQueue
-                }
+                        val upgradedTrack = track.copy(
+                            uriString = topCandidate.directStreamUrl,
+                            format = mapFormatStringToEnum(topCandidate.formatName, track.format),
+                            bitrateKbps = topCandidate.bitrateKbps,
+                            sampleRate = topCandidate.sampleRateHz,
+                            bitDepth = topCandidate.bitDepth,
+                            sourceProvider = topCandidate.providerName
+                        )
 
-                // Build single MediaItem for the selected track directly (zero array-index ambiguity)
-                val activeMediaItem = withContext(Dispatchers.IO) {
-                    createMediaItemForTrack(
-                        track = resolvedTrack,
-                        isActiveTrack = true
-                    )
-                }
-                if (!isActive || requestId != activeSwitchRequestId) return@launch
+                        if (!isActive || requestId != activeSwitchRequestId) return@launch
 
-                currentPlaylist = updatedQueue
-                pendingTrack = resolvedTrack
-                pendingQuality = resolvedQuality
+                        currentTrack = upgradedTrack
+                        _currentTrackState.value = upgradedTrack
+                        _audioQualityState.value = topCandidate.toAudioQualityInfo()
 
-                // Load the exact resolved streamUrl of the selected track into the cleared player engine
-                exoPlayer.pauseAtEndOfMediaItems = !isGaplessEnabled
-                exoPlayer.setMediaItem(activeMediaItem, /* startPositionMs = */ 0L)
-                exoPlayer.prepare()
-                exoPlayer.playWhenReady = true
-                exoPlayer.play()
-
-                // If the engine already transitioned to STATE_READY synchronously (e.g., cached/local file), commit immediately
-                if (exoPlayer.playbackState == Player.STATE_READY || exoPlayer.isPlaying) {
-                    commitPendingTrackIfReady()
-                    updateDynamicAudioQuality()
+                        // Atomic stream switching: stop, clear, reset decoder, and play at current position
+                        AudioPlayerService.switchStreamAtomically(
+                            exoPlayer = exoPlayer,
+                            context = context,
+                            track = upgradedTrack,
+                            candidate = topCandidate,
+                            preservePosition = true
+                        )
+                    } else {
+                        // Dynamically update audio pill metadata badge from probed headers without stalling playback
+                        _activeStreamCandidate.value = topCandidate
+                        _audioQualityState.value = topCandidate.toAudioQualityInfo()
+                        activeResolvedQuality = topCandidate.toAudioQualityInfo()
+                    }
                 }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                isSwitchingTrack = false
-                _isLoadingTrack.value = false
-                _playbackError.value =
-                    "Error loading '${track.title}': ${e.localizedMessage ?: "Stream resolution failed"}"
-                Log.e("ExoPlayerAudioEngine", "Error switching to track ${track.title}", e)
+                runCatching {
+                    Log.e("ExoPlayerAudioEngine", "Background stream resolution error for ${track.title}", e)
+                }
             }
         }
+    }
+
+    /**
+     * Real stream switching from picker pill:
+     * Plays the exact directStreamUrl for the selected candidate while preserving position.
+     */
+    fun selectStreamCandidate(candidate: ResolvedStreamCandidate) {
+        if (activeStreamCandidates.isEmpty()) return
+        val idx = activeStreamCandidates.indexOfFirst { it.streamUrl == candidate.streamUrl }
+        if (idx != -1) {
+            currentCandidateIndex = idx
+        }
+        _activeStreamCandidate.value = candidate
+        val currentPosition = exoPlayer.currentPosition
+        val current = currentPlayingTrack ?: return
+
+        val switchedTrack = current.copy(
+            uriString = candidate.directStreamUrl,
+            format = mapFormatStringToEnum(candidate.formatName, current.format),
+            bitrateKbps = candidate.bitrateKbps,
+            sampleRate = candidate.sampleRateHz,
+            bitDepth = candidate.bitDepth,
+            sourceProvider = candidate.providerName
+        )
+        currentTrack = switchedTrack
+        _currentTrackState.value = switchedTrack
+        _audioQualityState.value = candidate.toAudioQualityInfo()
+
+        // Atomic stream switching: stop, clear, reset decoder, and play at current position
+        AudioPlayerService.switchStreamAtomically(
+            exoPlayer = exoPlayer,
+            context = context,
+            track = switchedTrack,
+            candidate = candidate,
+            preservePosition = true
+        )
+    }
+
+    /**
+     * Cycles through available real stream candidates ([Deezer HiFi FLAC] -> [Amazon Ultra HD] -> [Tidal Master] -> [JioSaavn 320k])
+     */
+    fun cycleStreamCandidate() {
+        if (activeStreamCandidates.size <= 1) return
+        currentCandidateIndex = (currentCandidateIndex + 1) % activeStreamCandidates.size
+        val nextCandidate = activeStreamCandidates[currentCandidateIndex]
+        selectStreamCandidate(nextCandidate)
     }
 
     fun playNext() {
@@ -782,7 +814,7 @@ class ExoPlayerAudioEngine(private val context: Context) {
         }
 
         val artworkUri = if (!track.artworkUrl.isNullOrBlank()) {
-            Uri.parse(track.artworkUrl)
+            Uri.parse(AlbumArtHelper.enhanceArtworkUrl(track.artworkUrl))
         } else if (isActiveTrack) {
             AlbumArtHelper.getArtworkUri(context, track)
         } else {

@@ -3,12 +3,14 @@ package com.example.download
 import android.content.Context
 import android.net.Uri
 import android.util.Log
+import com.example.audio.AudioMetadataProber
 import com.example.data.MusicRepository
 import com.example.model.AudioFormat
 import com.example.model.AudioTrack
 import com.example.model.StreamBackend
 import com.example.network.DownloadQualityOption
 import com.example.network.UniversalStreamResolver
+import com.example.util.AlbumArtHelper
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -83,31 +85,38 @@ class SongDownloadManager(
                     backend
                 }
 
-                // 1. Resolve full stream URL without 30s limits
-                val (resolvedUrl, qualityInfo) = if (
+                // 1. Resolve full stream URL with strict Search-Playback-Download parity:
+                // Prefer the exact verified master candidate already resolved for playback if available
+                val cachedTopCandidate = UniversalStreamResolver.getTopResolvedCandidateForTrack(track.id)
+                val (resolvedUrl, qualityInfo) = when {
+                    cachedTopCandidate != null && cachedTopCandidate.streamUrl.isNotBlank() &&
+                        (qualityOption == DownloadQualityOption.HI_RES_LOSSLESS || !cachedTopCandidate.isLossless) -> {
+                        Pair(cachedTopCandidate.streamUrl, cachedTopCandidate.toAudioQualityInfo())
+                    }
                     qualityOption == DownloadQualityOption.HI_RES_LOSSLESS &&
-                    !track.uriString.isNullOrBlank() &&
-                    (track.uriString.endsWith(".flac", ignoreCase = true) ||
-                        track.uriString.endsWith(".wav", ignoreCase = true) ||
-                        track.uriString.endsWith(".alac", ignoreCase = true))
-                ) {
-                    Pair(
-                        track.uriString,
-                        com.example.model.AudioQualityInfo(
-                            formatName = track.format.displayName,
-                            sampleRateHz = track.sampleRate.coerceAtLeast(96000),
-                            bitDepth = track.bitDepth.coerceAtLeast(24),
-                            bitrateKbps = track.bitrateKbps.takeIf { it > 320 } ?: 2822,
-                            isLossless = true,
-                            isHiRes = true
+                        !track.uriString.isNullOrBlank() &&
+                        (track.uriString.endsWith(".flac", ignoreCase = true) ||
+                            track.uriString.endsWith(".wav", ignoreCase = true) ||
+                            track.uriString.endsWith(".alac", ignoreCase = true)) -> {
+                        Pair(
+                            track.uriString,
+                            com.example.model.AudioQualityInfo(
+                                formatName = track.format.displayName,
+                                sampleRateHz = track.sampleRate.coerceAtLeast(44100),
+                                bitDepth = track.bitDepth.coerceAtLeast(16),
+                                bitrateKbps = track.bitrateKbps.takeIf { it > 320 } ?: 1411,
+                                isLossless = true,
+                                isHiRes = true
+                            )
                         )
-                    )
-                } else {
-                    UniversalStreamResolver.resolveFullAudioStream(
-                        context = context,
-                        track = track,
-                        backend = effectiveBackend
-                    )
+                    }
+                    else -> {
+                        UniversalStreamResolver.resolveFullAudioStream(
+                            context = context,
+                            track = track,
+                            backend = effectiveBackend
+                        )
+                    }
                 }
 
                 // Apply user's selected quality tier (preserves raw stream when HI_RES_LOSSLESS is selected)
@@ -191,9 +200,10 @@ class SongDownloadManager(
 
                 // 3. Cache high-res artwork locally for offline viewing
                 var localArtPath: String? = null
-                if (!track.artworkUrl.isNullOrBlank() && track.artworkUrl.startsWith("http")) {
+                val enhancedArtworkUrl = AlbumArtHelper.enhanceArtworkUrl(track.artworkUrl)
+                if (enhancedArtworkUrl.isNotBlank() && enhancedArtworkUrl.startsWith("http")) {
                     try {
-                        val artReq = Request.Builder().url(track.artworkUrl).build()
+                        val artReq = Request.Builder().url(enhancedArtworkUrl).build()
                         val artResp = httpClient.newCall(artReq).execute()
                         if (artResp.isSuccessful) {
                             artResp.body?.byteStream()?.use { artIn ->
@@ -209,21 +219,30 @@ class SongDownloadManager(
                     }
                 }
 
-                val sizeMb = "%.1f MB".format(targetAudioFile.length() / (1024.0 * 1024.0))
-                val actualBitrate = if (isLosslessDownload) {
-                    maxOf(track.bitrateKbps, qualityInfo.bitrateKbps).takeIf { it > 320 } ?: 2822
-                } else {
-                    qualityOption.targetBitrateKbps
-                }
+                val downloadedBytes = targetAudioFile.length()
+                val sizeMb = "%.1f MB".format(downloadedBytes / (1024.0 * 1024.0))
                 val actualSampleRate = if (isLosslessDownload) {
-                    maxOf(track.sampleRate, qualityInfo.sampleRateHz).takeIf { it >= 44100 } ?: 96000
+                    maxOf(track.sampleRate, qualityInfo.sampleRateHz).takeIf { it >= 44100 } ?: 44100
                 } else {
                     44100
                 }
                 val actualBitDepth = if (isLosslessDownload) {
-                    maxOf(track.bitDepth, qualityInfo.bitDepth).takeIf { it >= 24 } ?: 24
+                    maxOf(track.bitDepth, qualityInfo.bitDepth).takeIf { it >= 16 } ?: 16
                 } else {
                     16
+                }
+                val derivedContainerBitrate = AudioMetadataProber.deriveBitrateFromSizeAndDuration(
+                    fileSizeBytes = downloadedBytes,
+                    durationMs = track.durationMs,
+                    formatName = targetFormat.displayName,
+                    sampleRateHz = actualSampleRate,
+                    bitDepth = actualBitDepth,
+                    channels = 2
+                )
+                val actualBitrate = when {
+                    derivedContainerBitrate > 0 -> derivedContainerBitrate
+                    isLosslessDownload -> maxOf(track.bitrateKbps, qualityInfo.bitrateKbps).takeIf { it > 320 } ?: 1411
+                    else -> qualityOption.targetBitrateKbps
                 }
                 val qualityLabel = if (isLosslessDownload) {
                     "$sizeMb • $actualBitrate kbps Hi-Res ${targetFormat.displayName} (Lossless Bit-Perfect)"

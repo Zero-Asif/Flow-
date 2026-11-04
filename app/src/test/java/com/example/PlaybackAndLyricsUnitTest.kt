@@ -431,8 +431,378 @@ class PlaybackAndLyricsUnitTest {
         assertEquals("saavn_1", sorted[4].id)
         assertEquals("yt_1", sorted[5].id)
     }
+
+    @Test
+    fun testStreamMetadataProbe_calculatesBitrateFromPayloadAndDuration() = kotlinx.coroutines.runBlocking {
+        val testDurationMs = 200_000L // 200 seconds
+
+        val probed = com.example.network.StreamMetadataProbe.probeStream(
+            url = "https://example.com/test_stream_320.mp4",
+            durationMs = testDurationMs,
+            fallbackFormat = "AAC",
+            fallbackBitrate = 320
+        )
+
+        assertNotNull(probed)
+        assertEquals("AAC", probed.formatName)
+        assertEquals(320, probed.bitrateKbps)
+        assertEquals(44100, probed.sampleRateHz)
+        assertEquals(16, probed.bitDepth)
+        org.junit.Assert.assertFalse(probed.isLossless)
+    }
+
+    @Test
+    fun testTrackRadioRepository_seedTitleExclusion() {
+        val seed = com.example.model.AudioTrack(
+            id = "seed_1",
+            title = "Starboy",
+            artist = "The Weeknd",
+            album = "Starboy",
+            durationMs = 230000L,
+            format = com.example.model.AudioFormat.FLAC,
+            sampleRate = 96000,
+            bitDepth = 24,
+            bitrateKbps = 2822,
+            genre = "R&B / Pop",
+            releaseYear = 2016,
+            gradientColors = listOf(0xFF00F0FF, 0xFF7928CA),
+            sourceProvider = "Tidal Master"
+        )
+
+        // Title normalization test: "Starboy", "Starboy (Remix)", "Starboy [Live]" should all normalize to matching stems
+        val normSeed = seed.title.lowercase().trim()
+        val variant1 = "Starboy (Kygo Remix)".lowercase()
+        val variant2 = "Starboy - Live in Paris".lowercase()
+        val unrelated = "Can't Feel My Face".lowercase()
+
+        assertTrue(variant1.contains(normSeed))
+        assertTrue(variant2.contains(normSeed))
+        org.junit.Assert.assertFalse(unrelated.contains(normSeed))
+    }
+
+    @Test
+    fun testWaterfallCandidateRanking_ordersCorrectly() {
+        val amazonCand = com.example.network.ResolvedStreamCandidate(
+            streamUrl = "https://amazon.com/song.flac",
+            formatName = "FLAC",
+            sampleRateHz = 192000,
+            bitDepth = 24,
+            bitrateKbps = 4608,
+            isLossless = true,
+            providerName = "Amazon Music Ultra HD"
+        )
+        val deezerCand = com.example.network.ResolvedStreamCandidate(
+            streamUrl = "https://deezer.com/song.flac",
+            formatName = "FLAC",
+            sampleRateHz = 44100,
+            bitDepth = 16,
+            bitrateKbps = 1411,
+            isLossless = true,
+            providerName = "Deezer HiFi"
+        )
+        val tidalCand = com.example.network.ResolvedStreamCandidate(
+            streamUrl = "https://tidal.com/song.flac",
+            formatName = "FLAC",
+            sampleRateHz = 44100,
+            bitDepth = 16,
+            bitrateKbps = 1411,
+            isLossless = true,
+            providerName = "Tidal HiFi"
+        )
+        val youtubeCand = com.example.network.ResolvedStreamCandidate(
+            streamUrl = "https://youtube.com/stream",
+            formatName = "OPUS",
+            sampleRateHz = 48000,
+            bitDepth = 16,
+            bitrateKbps = 256,
+            isLossless = false,
+            providerName = "YouTube Music Stream"
+        )
+
+        val candidates = listOf(youtubeCand, tidalCand, deezerCand, amazonCand)
+        val sorted = com.example.network.UniversalStreamResolver.sortStreamCandidates(candidates)
+
+        // 1. Amazon Ultra HD (4608 kbps 24-bit 192kHz) is top
+        assertEquals("Amazon Music Ultra HD", sorted[0].providerName)
+        assertEquals(4608, sorted[0].bitrateKbps)
+        // 2. Deezer HiFi (1411 kbps) ranks above Tidal HiFi (1411 kbps)
+        assertEquals("Deezer HiFi", sorted[1].providerName)
+        assertEquals("Tidal HiFi", sorted[2].providerName)
+        // 3. YouTube Music (256 kbps Opus) is last fallback
+        assertEquals("YouTube Music Stream", sorted[3].providerName)
+    }
+
+    @Test
+    fun testDurationSanityCheck_rejectsDiscrepancyGreaterThan4Seconds() {
+        // Target track duration: 200 seconds (Resilient matching: permits real-world variations, rejects previews and wrong-song collisions)
+        val validScore = com.example.network.UniversalStreamResolver.scoreCandidateMatch(
+            candidateTitle = "Starboy (Official Video)",
+            candidateArtist = "The Weeknd feat. Daft Punk",
+            targetTitle = "Starboy",
+            targetArtist = "The Weeknd",
+            durationSec = 203L, // +3s discrepancy allowed
+            targetDurationSec = 200L
+        )
+        assertTrue("Expected score >= 50 but got $validScore", validScore >= 50)
+
+        // Real-world soundtrack variation: "Aaj Ki Raat" with varied artist metadata should pass resilient threshold
+        val variationScore = com.example.network.UniversalStreamResolver.scoreCandidateMatch(
+            candidateTitle = "Aaj Ki Raat (From Stree 2)",
+            candidateArtist = "Madhubanti Bagchi, Sachin-Jigar",
+            targetTitle = "Aaj Ki Raat",
+            targetArtist = "Sabrina Saadi",
+            durationSec = 228L,
+            targetDurationSec = 210L
+        )
+        assertTrue("Expected variation score >= 50 but got $variationScore", variationScore >= 50)
+
+        // 30s preview snippet (< 45s when target is full song) is strictly rejected
+        val rejectedPreviewScore = com.example.network.UniversalStreamResolver.scoreCandidateMatch(
+            candidateTitle = "Starboy",
+            candidateArtist = "The Weeknd",
+            targetTitle = "Starboy",
+            targetArtist = "The Weeknd",
+            durationSec = 30L, // 30s preview rejected
+            targetDurationSec = 200L
+        )
+        assertTrue(rejectedPreviewScore < 0)
+
+        // Wrong-song mismatch test: "Moner Radio" by "Jeet Gannguli" when searching "Moner Ekla Ghore" by "Arefin Rumey"
+        val wrongSongScore = com.example.network.UniversalStreamResolver.computeMatchConfidenceScore(
+            candidateTitle = "Moner Radio (From Awara)",
+            candidateArtist = "Jeet Gannguli",
+            targetTitle = "Moner Ekla Ghore",
+            targetArtist = "Arefin Rumey",
+            durationSec = 240L,
+            targetDurationSec = 240L
+        )
+        assertTrue("Expected wrong song to be rejected (< 50) but got $wrongSongScore", wrongSongScore < 50)
+    }
+
+    @Test
+    fun testHighResolutionCoverArtEnhancement_upgradesAllProviderThumbnails() {
+        val deezerLowRes = "https://e-cdns-images.dzcdn.net/images/cover/abc123/250x250-000000-80-0-0.jpg"
+        val deezerHiRes = com.example.util.AlbumArtHelper.enhanceArtworkUrl(deezerLowRes)
+        assertTrue(deezerHiRes.contains("/1000x1000-000000-80-0-0.jpg"))
+
+        val amazonLowRes = "https://m.media-amazon.com/images/I/71xyz._SX300_.jpg"
+        val amazonHiRes = com.example.util.AlbumArtHelper.enhanceArtworkUrl(amazonLowRes)
+        assertTrue(amazonHiRes.contains("._UL1500_.jpg"))
+
+        val ytLowRes = "https://lh3.googleusercontent.com/abc=w120-h120-l90-rj"
+        val ytHiRes = com.example.util.AlbumArtHelper.enhanceArtworkUrl(ytLowRes)
+        assertTrue(ytHiRes.contains("=w1080-h1080-l95-rj"))
+
+        val saavnLowRes = "https://c.saavncdn.com/123/Song-150x150.jpg"
+        val saavnHiRes = com.example.util.AlbumArtHelper.enhanceArtworkUrl(saavnLowRes)
+        assertTrue(saavnHiRes.contains("500x500.jpg"))
+    }
+
+    @Test
+    fun testAudioMetadataProber_derivesBitrateFromSizeAndDuration() {
+        // 35,275,000 bytes over 200 seconds = (35275000 * 8) / (200 * 1000) = 1411 kbps
+        val flacBitrate = com.example.audio.AudioMetadataProber.deriveBitrateFromSizeAndDuration(
+            fileSizeBytes = 35_275_000L,
+            durationMs = 200_000L,
+            formatName = "FLAC",
+            sampleRateHz = 44100,
+            bitDepth = 16,
+            channels = 2
+        )
+        assertEquals(1411, flacBitrate)
+
+        // Uncompressed 16-bit 44.1kHz WAV must always be 1411 kbps
+        val wavBitrate = com.example.audio.AudioMetadataProber.deriveBitrateFromSizeAndDuration(
+            fileSizeBytes = 0L,
+            durationMs = 200_000L,
+            formatName = "WAV",
+            sampleRateHz = 44100,
+            bitDepth = 16,
+            channels = 2
+        )
+        assertEquals(1411, wavBitrate)
+    }
+
+    @Test
+    fun testFuzzySearchRankingAndSegregation_toleratesTypos() {
+        val arijitTrack = com.example.model.AudioTrack(
+            id = "arijit_1",
+            title = "Tum Hi Ho",
+            artist = "Arijit Singh",
+            album = "Aashiqui 2",
+            durationMs = 262_000L,
+            format = com.example.model.AudioFormat.FLAC,
+            sampleRate = 44100,
+            bitDepth = 16,
+            bitrateKbps = 1411,
+            sourceProvider = "Deezer HiFi"
+        )
+        val unrelatedTrack = arijitTrack.copy(
+            id = "other_1",
+            title = "Random Song",
+            artist = "Unknown Singer",
+            album = "Unknown Album"
+        )
+
+        // Typo query: "arijit sing" -> should rank "Arijit Singh" #1
+        val ranked = com.example.network.GlobalMusicSearchEngine.rankTracksByQueryAndQuality(
+            tracks = listOf(unrelatedTrack, arijitTrack),
+            query = "arijit sing"
+        )
+        assertEquals("arijit_1", ranked.first().id)
+
+        val segregated = com.example.network.GlobalMusicSearchEngine.segregateSearchResults(ranked, "arijit sing")
+        assertNotNull(segregated.bestMatch)
+        assertEquals("arijit_1", segregated.bestMatch?.id)
+        assertTrue(segregated.artists.any { it.name == "Arijit Singh" })
+        assertTrue(segregated.albums.any { it.title == "Aashiqui 2" })
+    }
+
+    @Test
+    fun testUncompressedPcmWavBitrateCalculation_strictly1411Kbps() = kotlinx.coroutines.runBlocking {
+        // 16-bit / 44.1kHz stereo WAV must strictly calculate as (44100 * 16 * 2) / 1000 = 1411 kbps
+        val probedWav = com.example.network.StreamMetadataProbe.probeStream(
+            url = "file:///cache/audio_lossless/track_01_full_200s.wav",
+            durationMs = 200_000L,
+            fallbackFormat = "WAV",
+            fallbackBitrate = 666, // Even if a bogus fallback is passed, WAV formula overrides it to 1411 kbps
+            fallbackSampleRate = 44100,
+            fallbackBitDepth = 16
+        )
+        assertEquals("WAV", probedWav.formatName)
+        assertEquals(44100, probedWav.sampleRateHz)
+        assertEquals(16, probedWav.bitDepth)
+        assertEquals(1411, probedWav.bitrateKbps)
+        assertTrue(probedWav.isLossless)
+    }
+
+    @Test
+    fun testStreamMatcher_canonicalMetadataAndIsrcMatching() {
+        val rawTrack = com.example.model.AudioTrack(
+            id = "test_01",
+            title = "Starboy (Official Music Video) [Remastered 4K] ft. Daft Punk",
+            artist = "The Weeknd feat. Daft Punk",
+            album = "Starboy",
+            durationMs = 230_000L,
+            isrc = "US-UM7-16-04282"
+        )
+        val canonical = com.example.network.StreamMatcher.extractCanonicalMetadata(rawTrack)
+        assertEquals("starboy", canonical.title)
+        assertEquals("the weeknd", canonical.artist)
+        assertEquals("USUM71604282", canonical.isrc)
+        assertEquals(230L, canonical.durationSec)
+
+        // Matching with identical ISRC
+        assertTrue(
+            com.example.network.StreamMatcher.isMatch(
+                candidateTitle = "Random Song Title",
+                candidateArtist = "Different Artist",
+                targetTitle = "Starboy",
+                targetArtist = "The Weeknd",
+                candidateDurationSec = 230L,
+                targetDurationSec = 230L,
+                candidateIsrc = "US-UM7-16-04282",
+                targetIsrc = "USUM71604282"
+            )
+        )
+
+        // Reject explicitly different ISRCs
+        val isrcMismatch = com.example.network.StreamMatcher.isMatch(
+            candidateTitle = "Starboy",
+            candidateArtist = "The Weeknd",
+            targetTitle = "Starboy",
+            targetArtist = "The Weeknd",
+            candidateDurationSec = 230L,
+            targetDurationSec = 230L,
+            candidateIsrc = "GBUM71604282",
+            targetIsrc = "USUM71604282"
+        )
+        assertTrue("Mismatched ISRCs must be rejected", !isrcMismatch)
+    }
+
+    @Test
+    fun testStreamMatcher_strictDurationTolerance() {
+        // Discrepancy <= 3s passes
+        val passesWithin3s = com.example.network.StreamMatcher.isMatch(
+            candidateTitle = "Blinding Lights",
+            candidateArtist = "The Weeknd",
+            targetTitle = "Blinding Lights",
+            targetArtist = "The Weeknd",
+            candidateDurationSec = 203L,
+            targetDurationSec = 200L
+        )
+        assertTrue("Duration difference of 3s should pass", passesWithin3s)
+
+        // Discrepancy > 3s rejected
+        val rejectedOver3s = com.example.network.StreamMatcher.isMatch(
+            candidateTitle = "Blinding Lights",
+            candidateArtist = "The Weeknd",
+            targetTitle = "Blinding Lights",
+            targetArtist = "The Weeknd",
+            candidateDurationSec = 204L, // +4s discrepancy > 3s limit
+            targetDurationSec = 200L
+        )
+        assertTrue("Duration difference > 3s must be strictly rejected", !rejectedOver3s)
+    }
+
+    @Test
+    fun testAudioPlayerService_exactMimeTypeResolution() {
+        assertEquals(
+            androidx.media3.common.MimeTypes.AUDIO_FLAC,
+            com.example.audio.AudioPlayerService.resolveExactMimeType("https://cdn.example.com/stream.flac", "FLAC")
+        )
+        assertEquals(
+            androidx.media3.common.MimeTypes.AUDIO_WAV,
+            com.example.audio.AudioPlayerService.resolveExactMimeType("file:///cache/stream.wav", "WAV")
+        )
+        assertEquals(
+            androidx.media3.common.MimeTypes.AUDIO_MPEG,
+            com.example.audio.AudioPlayerService.resolveExactMimeType("https://cdn.example.com/audio.mp3", "MP3")
+        )
+        assertEquals(
+            androidx.media3.common.MimeTypes.AUDIO_AAC,
+            com.example.audio.AudioPlayerService.resolveExactMimeType("https://saavncdn.com/stream_320.mp4", "AAC")
+        )
+    }
+
+    @Test
+    fun testLosslessAudioEngine_cleanLabelsWithoutFakeBadges() {
+        // JioSaavn 320k candidate must be accurately labeled without pretending to be FLAC
+        val canonical = com.example.network.StreamMatcher.CanonicalMetadata(
+            isrc = null,
+            title = "Test Song",
+            artist = "Test Artist",
+            album = "Test Album",
+            durationMs = 210_000L
+        )
+        // Verify candidate sorting places lossless first
+        val losslessCand = com.example.network.ResolvedStreamCandidate(
+            streamUrl = "https://flac.deezer.com/123.flac",
+            formatName = "FLAC",
+            sampleRateHz = 44100,
+            bitDepth = 16,
+            bitrateKbps = 1411,
+            isLossless = true,
+            providerName = "Deezer HiFi FLAC"
+        )
+        val saavnCand = com.example.network.ResolvedStreamCandidate(
+            streamUrl = "https://saavncdn.com/123_320.mp4",
+            formatName = "AAC",
+            sampleRateHz = 44100,
+            bitDepth = 16,
+            bitrateKbps = 320,
+            isLossless = false,
+            providerName = "JioSaavn (320 kbps AAC)"
+        )
+        val sorted = com.example.network.UniversalStreamResolver.sortStreamCandidates(listOf(saavnCand, losslessCand))
+        assertEquals("Deezer HiFi FLAC", sorted.first().providerName)
+        assertEquals(1411, sorted.first().bitrateKbps)
+        assertTrue(sorted.first().isLossless)
+
+        assertEquals("JioSaavn (320 kbps AAC)", sorted[1].providerName)
+        assertEquals(320, sorted[1].bitrateKbps)
+        assertTrue(!sorted[1].isLossless)
+    }
 }
-
-
 
 

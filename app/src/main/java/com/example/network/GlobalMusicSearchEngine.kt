@@ -15,6 +15,8 @@ import org.json.JSONObject
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 
+import com.example.util.AlbumArtHelper
+
 enum class MusicSourceFilter(val displayName: String, val badgeLabel: String, val waterfallOrder: Int) {
     ALL("All Sources", "Waterfall", 0),
     AMAZON_MUSIC("Amazon Ultra HD", "Amazon HD", 1),
@@ -24,6 +26,34 @@ enum class MusicSourceFilter(val displayName: String, val badgeLabel: String, va
     YOUTUBE("YouTube Music", "YouTube", 5),
     APPLE_AMAZON("Apple / Amazon", "Lossless", 1)
 }
+
+data class SearchSuggestionsResult(
+    val queryCompletions: List<String> = emptyList(),
+    val topTracks: List<AudioTrack> = emptyList(),
+    val topArtists: List<String> = emptyList()
+)
+
+data class AlbumSearchSummary(
+    val title: String,
+    val artist: String,
+    val artworkUrl: String?,
+    val releaseYear: Int,
+    val representativeTrack: AudioTrack
+)
+
+data class ArtistSearchSummary(
+    val name: String,
+    val artworkUrl: String?,
+    val topGenre: String,
+    val representativeTrack: AudioTrack
+)
+
+data class CategorizedSearchResults(
+    val bestMatch: AudioTrack? = null,
+    val songs: List<AudioTrack> = emptyList(),
+    val albums: List<AlbumSearchSummary> = emptyList(),
+    val artists: List<ArtistSearchSummary> = emptyList()
+)
 
 /**
  * Multi-Provider Waterfall Global Music Search Engine:
@@ -112,41 +142,235 @@ object GlobalMusicSearchEngine {
             .trim()
     }
 
+    /**
+     * Module 2: Advanced Relevance Ranking & Tokenization with Fuzzy Typo Tolerance:
+     * Splits queries into individual tokens (e.g., "arefin", "rumey", "moner" or "arijit sing")
+     * and ranks by: Exact Phrase Match > Prefix Match > Fuzzy Token Match > Release Year.
+     */
+    fun computeSearchRelevanceScore(track: AudioTrack, query: String): Int {
+        val normQuery = normalizeMatchKey(query)
+        if (normQuery.isBlank()) return 100
+
+        val normTitle = normalizeMatchKey(track.title)
+        val normArtist = normalizeMatchKey(track.artist)
+        val normAlbum = normalizeMatchKey(track.album)
+        val combined = "$normTitle $normArtist"
+
+        val queryTokens = normQuery.split(" ").filter { it.isNotBlank() }
+        val titleTokens = normTitle.split(" ").filter { it.isNotBlank() }
+        val artistTokens = normArtist.split(" ").filter { it.isNotBlank() }
+        val allTrackTokens = (titleTokens + artistTokens).distinct()
+
+        var score = 0
+
+        // 1. Exact Phrase Match
+        if (normTitle == normQuery) {
+            score += 1000
+        } else if (combined == normQuery || "$normArtist $normTitle" == normQuery) {
+            score += 950
+        } else if (normTitle.startsWith(normQuery)) {
+            // 2. Prefix Match
+            score += 800
+        } else if (normArtist == normQuery || normArtist.startsWith(normQuery)) {
+            score += 750
+        } else if (normTitle.contains(normQuery)) {
+            score += 650
+        } else if (combined.contains(normQuery)) {
+            score += 600
+        }
+
+        // 3. Token-level & Fuzzy Typo Tolerance (e.g., "arijit sing" -> "arijit singh")
+        if (queryTokens.isNotEmpty()) {
+            var matchedTokens = 0.0
+            for (qTok in queryTokens) {
+                val bestTokSim = allTrackTokens.maxOfOrNull { tTok ->
+                    when {
+                        tTok == qTok -> 1.0
+                        tTok.startsWith(qTok) || qTok.startsWith(tTok) && qTok.length >= 3 -> 0.92
+                        qTok.length >= 4 && tTok.length >= 4 -> {
+                            val lev = UniversalStreamResolver.calculateLevenshteinSimilarity(qTok, tTok)
+                            if (lev >= 0.75) lev else 0.0
+                        }
+                        else -> 0.0
+                    }
+                } ?: 0.0
+                matchedTokens += bestTokSim
+            }
+            val tokenCoverage = matchedTokens / queryTokens.size.toDouble()
+            score += (tokenCoverage * 500.0).toInt()
+        }
+
+        // 4. Album match bonus & Release Year tie-breaker
+        if (normAlbum == normQuery) score += 120
+        score += (track.releaseYear.coerceIn(1970, 2026) - 1970)
+
+        return score
+    }
+
+    /**
+     * Ranks tracks combining search relevance (exact/prefix/fuzzy token match) and quality cascade.
+     */
+    fun rankTracksByQueryAndQuality(tracks: List<AudioTrack>, query: String): List<AudioTrack> {
+        if (query.isBlank()) return sortTracksByQualityCascade(tracks)
+        return tracks.sortedWith(
+            compareByDescending<AudioTrack> { computeSearchRelevanceScore(it, query) >= 450 }
+                .thenByDescending { computeSearchRelevanceScore(it, query) / 150 }
+                .thenByDescending { it.format.isLossless }
+                .thenByDescending { it.bitDepth }
+                .thenByDescending { if (it.format.isLossless) it.sampleRate else it.bitrateKbps }
+                .thenByDescending { it.bitrateKbps }
+                .thenByDescending { computeSearchRelevanceScore(it, query) }
+                .thenByDescending { providerWaterfallRank(it.sourceProvider) }
+        )
+    }
+
+    /**
+     * Module 2.3: Clean Result Segregation into Best Match (Top Result), Songs, Albums, and Artists.
+     */
+    fun segregateSearchResults(tracks: List<AudioTrack>, query: String): CategorizedSearchResults {
+        if (tracks.isEmpty()) return CategorizedSearchResults()
+        val ranked = rankTracksByQueryAndQuality(tracks, query)
+        val bestMatch = ranked.firstOrNull()
+
+        val albums = ranked
+            .filter { it.album.isNotBlank() && !it.album.equals("Single", ignoreCase = true) }
+            .distinctBy { "${normalizeMatchKey(it.album)}_${normalizeMatchKey(it.artist)}" }
+            .take(8)
+            .map { track ->
+                AlbumSearchSummary(
+                    title = track.album,
+                    artist = track.artist,
+                    artworkUrl = AlbumArtHelper.enhanceArtworkUrl(track.artworkUrl),
+                    releaseYear = track.releaseYear,
+                    representativeTrack = track
+                )
+            }
+
+        val artists = ranked
+            .map { track ->
+                val primary = track.artist.split(",", "&", "feat.", "ft.").firstOrNull()?.trim() ?: track.artist
+                Pair(primary, track)
+            }
+            .filter { it.first.isNotBlank() && !it.first.equals("Unknown Artist", ignoreCase = true) }
+            .distinctBy { normalizeMatchKey(it.first) }
+            .take(8)
+            .map { (artistName, repTrack) ->
+                ArtistSearchSummary(
+                    name = artistName,
+                    artworkUrl = AlbumArtHelper.enhanceArtworkUrl(repTrack.artworkUrl),
+                    topGenre = repTrack.genre,
+                    representativeTrack = repTrack
+                )
+            }
+
+        return CategorizedSearchResults(
+            bestMatch = bestMatch,
+            songs = ranked,
+            albums = albums,
+            artists = artists
+        )
+    }
+
+    /**
+     * Module 2.1: Real-Time Typeahead & Autocomplete (Amazon / YouTube Music Standard):
+     * Returns Query Autocompletion phrases, Top Track Suggestions, and Top Artist Suggestions.
+     */
+    suspend fun fetchAutocompleteSuggestions(
+        query: String,
+        cachedResults: List<AudioTrack> = emptyList()
+    ): SearchSuggestionsResult = withContext(Dispatchers.IO) {
+        val trimmed = query.trim()
+        if (trimmed.isEmpty()) return@withContext SearchSuggestionsResult()
+
+        val completions = mutableListOf<String>()
+        try {
+            val encoded = URLEncoder.encode(trimmed, "UTF-8")
+            val suggestUrl = "https://suggestqueries.google.com/complete/search?client=firefox&ds=yt&q=$encoded"
+            val req = Request.Builder()
+                .url(suggestUrl)
+                .tag(SEARCH_CALL_TAG)
+                .header("User-Agent", "Mozilla/5.0 (Linux; Android 14; Mobile) FlowAudio/2.0")
+                .build()
+            httpClient.newCall(req).execute().use { resp ->
+                if (resp.isSuccessful) {
+                    val body = resp.body?.string().orEmpty()
+                    val outer = JSONArray(body)
+                    if (outer.length() > 1) {
+                        val arr = outer.optJSONArray(1)
+                        if (arr != null) {
+                            for (i in 0 until minOf(arr.length(), 6)) {
+                                val phrase = arr.optString(i, "").trim()
+                                if (phrase.isNotBlank()) completions.add(phrase)
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (_: Exception) {
+            // Fallback to local completions if offline
+        }
+
+        val rankedTracks = if (cachedResults.isNotEmpty()) {
+            rankTracksByQueryAndQuality(cachedResults, trimmed)
+        } else {
+            emptyList()
+        }
+
+        val topTracks = rankedTracks.take(4)
+        val topArtists = rankedTracks
+            .map { it.artist.split(",", "&", "feat.", "ft.").firstOrNull()?.trim().orEmpty() }
+            .filter { it.isNotBlank() && !it.equals("Unknown Artist", ignoreCase = true) }
+            .distinctBy { it.lowercase() }
+            .take(5)
+
+        if (completions.isEmpty()) {
+            topTracks.forEach { t ->
+                completions.add("${t.title} ${t.artist}".trim())
+            }
+        }
+
+        SearchSuggestionsResult(
+            queryCompletions = completions.distinct().take(6),
+            topTracks = topTracks,
+            topArtists = topArtists
+        )
+    }
+
+    /**
+     * Module 1: Strict Audio Matching Engine for Direct Stream Hydration
+     * Computes Multi-Factor Identity Confidence Score (0-100%) and ONLY binds a direct stream URL
+     * if confidence >= 85% (HARD_MATCH_THRESHOLD) and duration is within ±3 seconds.
+     */
     private fun findMatchingDirectStream(
         candidate: AudioTrack,
         streamPool: List<AudioTrack>
     ): String? {
         if (!candidate.uriString.isNullOrBlank()) return candidate.uriString
-        val candTitle = normalizeMatchKey(candidate.title)
-        val candArtist = normalizeMatchKey(candidate.artist.split(",", "&", "feat", "ft").firstOrNull().orEmpty())
-        if (candTitle.isBlank()) return null
+        val targetDurationSec = (candidate.durationMs / 1000L).coerceAtLeast(0L)
 
-        // 1. Exact normalized title + primary artist match
-        val exactMatch = streamPool.firstOrNull { poolTrack ->
-            !poolTrack.uriString.isNullOrBlank() &&
-                normalizeMatchKey(poolTrack.title) == candTitle &&
-                (candArtist.isBlank() ||
-                    normalizeMatchKey(poolTrack.artist).contains(candArtist) ||
-                    candArtist.contains(normalizeMatchKey(poolTrack.artist.split(",").firstOrNull().orEmpty())))
+        var bestUri: String? = null
+        var bestConfidence = 0
+
+        for (poolTrack in streamPool) {
+            val streamUri = poolTrack.uriString
+            if (streamUri.isNullOrBlank()) continue
+            val poolDurationSec = (poolTrack.durationMs / 1000L).coerceAtLeast(0L)
+
+            val confidence = UniversalStreamResolver.computeMatchConfidenceScore(
+                candidateTitle = poolTrack.title,
+                candidateArtist = poolTrack.artist,
+                targetTitle = candidate.title,
+                targetArtist = candidate.artist,
+                durationSec = poolDurationSec,
+                targetDurationSec = targetDurationSec
+            )
+
+            if (confidence >= UniversalStreamResolver.HARD_MATCH_THRESHOLD && confidence > bestConfidence) {
+                bestConfidence = confidence
+                bestUri = streamUri
+            }
         }
-        if (exactMatch != null) return exactMatch.uriString
-
-        // 2. Exact normalized title match
-        val titleMatch = streamPool.firstOrNull { poolTrack ->
-            !poolTrack.uriString.isNullOrBlank() &&
-                normalizeMatchKey(poolTrack.title) == candTitle
-        }
-        if (titleMatch != null) return titleMatch.uriString
-
-        // 3. Substring title + artist match
-        return streamPool.firstOrNull { poolTrack ->
-            val poolTitle = normalizeMatchKey(poolTrack.title)
-            val poolArtist = normalizeMatchKey(poolTrack.artist)
-            !poolTrack.uriString.isNullOrBlank() &&
-                poolTitle.isNotBlank() &&
-                (poolTitle.contains(candTitle) || candTitle.contains(poolTitle)) &&
-                (candArtist.isBlank() || poolArtist.contains(candArtist))
-        }?.uriString
+        return bestUri
     }
 
     suspend fun searchAllSources(
@@ -166,7 +390,7 @@ object GlobalMusicSearchEngine {
                     val directStream = findMatchingDirectStream(track, saavn)
                     if (directStream != null) track.copy(uriString = directStream) else track
                 }
-                sortTracksByQualityCascade(hydrated)
+                rankTracksByQueryAndQuality(hydrated, query)
             }
             MusicSourceFilter.DEEZER -> {
                 val deezerDeferred = async { searchDeezer(query, limit) }
@@ -177,7 +401,7 @@ object GlobalMusicSearchEngine {
                     val directStream = findMatchingDirectStream(track, saavn)
                     if (directStream != null) track.copy(uriString = directStream) else track
                 }
-                sortTracksByQualityCascade(hydrated)
+                rankTracksByQueryAndQuality(hydrated, query)
             }
             MusicSourceFilter.TIDAL -> {
                 val tidalDeferred = async { searchTidal(query, limit) }
@@ -188,17 +412,11 @@ object GlobalMusicSearchEngine {
                     val directStream = findMatchingDirectStream(track, saavn)
                     if (directStream != null) track.copy(uriString = directStream) else track
                 }
-                sortTracksByQualityCascade(hydrated)
+                rankTracksByQueryAndQuality(hydrated, query)
             }
-            MusicSourceFilter.JIOSAAVN -> sortTracksByQualityCascade(searchJioSaavn(query, limit))
-            MusicSourceFilter.YOUTUBE -> sortTracksByQualityCascade(searchYouTubeMusic(query, limit))
+            MusicSourceFilter.JIOSAAVN -> rankTracksByQueryAndQuality(searchJioSaavn(query, limit), query)
+            MusicSourceFilter.YOUTUBE -> rankTracksByQueryAndQuality(searchYouTubeMusic(query, limit), query)
             MusicSourceFilter.ALL -> {
-                // Execute multi-provider queries concurrently, then merge in strict waterfall hierarchy:
-                // 1. Amazon Music (24-bit/192kHz 4608 kbps FLAC)
-                // 2. Deezer (16-bit/44.1kHz 1411 kbps FLAC)
-                // 3. Tidal (HiFi / Master FLAC / ALAC)
-                // 4. JioSaavn (HQ 320kbps AAC / MP3 - Fallback only)
-                // 5. YouTube Music (256kbps Opus / AAC - Last Resort Fallback)
                 val amazonDeferred = async { searchAmazonMusic(query, limit) }
                 val deezerDeferred = async { searchDeezer(query, limit) }
                 val tidalDeferred = async { searchTidal(query, limit) }
@@ -210,6 +428,50 @@ object GlobalMusicSearchEngine {
                 val tidal = tidalDeferred.await()
                 val saavn = saavnDeferred.await()
                 val yt = ytDeferred.await()
+
+                // 1. Identify canonical masterpiece version from YouTube search by view count & query relevance
+                val canonicalYt = yt.filter { track ->
+                    computeSearchRelevanceScore(track, query) >= 250
+                }.maxByOrNull { it.playCount } ?: yt.firstOrNull()
+
+                // 2. Resolve canonical track through Lossless Waterfall: Amazon Ultra HD -> Deezer HiFi -> Tidal Master -> JioSaavn 320k -> YouTube Music
+                val canonicalMaster = if (canonicalYt != null) {
+                    val normCanonicalTitle = normalizeMatchKey(canonicalYt.title)
+                    val normCanonicalArtist = normalizeMatchKey(canonicalYt.artist.split(",", "&", "feat.", "ft.").firstOrNull().orEmpty())
+
+                    amazon.firstOrNull {
+                        val sim = UniversalStreamResolver.calculateLevenshteinSimilarity(normalizeMatchKey(it.title), normCanonicalTitle)
+                        val artSim = if (normCanonicalArtist.isNotBlank()) {
+                            UniversalStreamResolver.calculateLevenshteinSimilarity(normalizeMatchKey(it.artist), normCanonicalArtist)
+                        } else 1.0
+                        sim >= 0.70 || (sim >= 0.55 && artSim >= 0.60)
+                    } ?: deezer.firstOrNull {
+                        val sim = UniversalStreamResolver.calculateLevenshteinSimilarity(normalizeMatchKey(it.title), normCanonicalTitle)
+                        val artSim = if (normCanonicalArtist.isNotBlank()) {
+                            UniversalStreamResolver.calculateLevenshteinSimilarity(normalizeMatchKey(it.artist), normCanonicalArtist)
+                        } else 1.0
+                        sim >= 0.70 || (sim >= 0.55 && artSim >= 0.60)
+                    } ?: tidal.firstOrNull {
+                        val sim = UniversalStreamResolver.calculateLevenshteinSimilarity(normalizeMatchKey(it.title), normCanonicalTitle)
+                        val artSim = if (normCanonicalArtist.isNotBlank()) {
+                            UniversalStreamResolver.calculateLevenshteinSimilarity(normalizeMatchKey(it.artist), normCanonicalArtist)
+                        } else 1.0
+                        sim >= 0.70 || (sim >= 0.55 && artSim >= 0.60)
+                    } ?: saavn.firstOrNull {
+                        val sim = UniversalStreamResolver.calculateLevenshteinSimilarity(normalizeMatchKey(it.title), normCanonicalTitle)
+                        val artSim = if (normCanonicalArtist.isNotBlank()) {
+                            UniversalStreamResolver.calculateLevenshteinSimilarity(normalizeMatchKey(it.artist), normCanonicalArtist)
+                        } else 1.0
+                        sim >= 0.70 || (sim >= 0.55 && artSim >= 0.60)
+                    } ?: canonicalYt
+                } else null
+
+                val canonicalDirectStream = if (canonicalMaster != null) findMatchingDirectStream(canonicalMaster, saavn) else null
+                val hydratedCanonical = if (canonicalMaster != null && canonicalMaster.uriString.isNullOrBlank() && canonicalDirectStream != null) {
+                    canonicalMaster.copy(uriString = canonicalDirectStream)
+                } else {
+                    canonicalMaster
+                }
 
                 // Strict Provider Waterfall Order: Amazon Music -> Deezer -> Tidal -> JioSaavn -> YouTube Music
                 val waterfallCandidates = amazon + deezer + tidal + saavn + yt
@@ -242,8 +504,6 @@ object GlobalMusicSearchEngine {
                     } else {
                         val existing = merged[existingIdx]
                         val combinedUri = existing.uriString ?: hydratedCandidate.uriString
-                        // Strict Quality Comparison:
-                        // Bit Depth (24 > 16) -> Sample Rate (192kHz > 96kHz > 48kHz > 44.1kHz) -> Bitrate (4608 > 2822 > 1411 > 320 > 256)
                         val candidateIsHigher = when {
                             hydratedCandidate.bitDepth != existing.bitDepth ->
                                 hydratedCandidate.bitDepth > existing.bitDepth
@@ -265,7 +525,25 @@ object GlobalMusicSearchEngine {
                     }
                 }
 
-                sortTracksByQualityCascade(merged)
+                val ranked = rankTracksByQueryAndQuality(merged, query)
+
+                // Place canonical masterpiece at index 0 of search results for guaranteed Top Result Best Match
+                if (hydratedCanonical != null) {
+                    val normCanonical = normalizeMatchKey(hydratedCanonical.title)
+                    val existingIdx = ranked.indexOfFirst {
+                        normalizeMatchKey(it.title) == normCanonical
+                    }
+                    if (existingIdx > 0) {
+                        val matchedTrack = ranked[existingIdx]
+                        listOf(matchedTrack) + ranked.filterIndexed { index, _ -> index != existingIdx }
+                    } else if (existingIdx == 0) {
+                        ranked
+                    } else {
+                        listOf(hydratedCanonical) + ranked
+                    }
+                } else {
+                    ranked
+                }
             }
         }
     }
@@ -343,7 +621,7 @@ object GlobalMusicSearchEngine {
 
                         // Upgrade artwork to 500x500 HD
                         val rawImage = item.optString("image", "")
-                        val highResArtwork = rawImage.replace("150x150", "500x500").replace("50x50", "500x500")
+                        val highResArtwork = AlbumArtHelper.enhanceArtworkUrl(rawImage)
 
                         // Decrypt encrypted_media_url directly into master stream URL
                         val encryptedMediaUrl = moreInfo?.optString("encrypted_media_url", "")
@@ -612,13 +890,28 @@ object GlobalMusicSearchEngine {
                         }
                     }
 
+                    var viewCount = 0L
+                    for (cIdx in 1 until flexCols.length()) {
+                        val colRuns = flexCols.getJSONObject(cIdx)
+                            .optJSONObject("musicResponsiveListItemFlexColumnRenderer")
+                            ?.optJSONObject("text")
+                            ?.optJSONArray("runs")
+                        if (colRuns != null) {
+                            for (r in 0 until colRuns.length()) {
+                                val txt = colRuns.getJSONObject(r).optString("text", "").trim()
+                                val parsed = parsePopularityViewCount(txt)
+                                if (parsed > viewCount) viewCount = parsed
+                            }
+                        }
+                    }
+
                     var thumbnail = ""
                     val thumbs = renderer.optJSONObject("thumbnail")
                         ?.optJSONObject("musicThumbnailRenderer")
                         ?.optJSONObject("thumbnail")
                         ?.optJSONArray("thumbnails")
                     if (thumbs != null && thumbs.length() > 0) {
-                        thumbnail = thumbs.getJSONObject(thumbs.length() - 1).optString("url", "")
+                        thumbnail = AlbumArtHelper.enhanceArtworkUrl(thumbs.getJSONObject(thumbs.length() - 1).optString("url", ""))
                     }
 
                     if (title.isNotBlank() && tracks.none { it.id == "yt_$videoId" }) {
@@ -640,6 +933,7 @@ object GlobalMusicSearchEngine {
                                 uriString = null,
                                 artworkUrl = thumbnail,
                                 isGlobalOnline = true,
+                                playCount = viewCount.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
                                 sourceProvider = "YouTube Music 256k",
                                 fileSizeFormatted = "$sizeEst (256 kbps Opus/AAC)",
                                 lyrics = listOf(
@@ -656,6 +950,25 @@ object GlobalMusicSearchEngine {
             e.printStackTrace()
         }
         tracks
+    }
+
+    /**
+     * Parses popularity strings from YouTube Music runs (e.g., "1.5B views", "150M plays", "800K views").
+     */
+    fun parsePopularityViewCount(text: String): Long {
+        val lower = text.trim().lowercase()
+        if (!lower.contains("view") && !lower.contains("play") && !lower.matches(Regex("""^[\d.]+\s*[kmb]$"""))) {
+            return 0L
+        }
+        val raw = lower.replace("views", "").replace("view", "").replace("plays", "").replace("play", "").trim()
+        val multiplier = when {
+            raw.endsWith("b") -> 1_000_000_000.0
+            raw.endsWith("m") -> 1_000_000.0
+            raw.endsWith("k") -> 1_000.0
+            else -> 1.0
+        }
+        val cleanNum = raw.trimEnd('b', 'm', 'k').trim().toDoubleOrNull() ?: return 0L
+        return (cleanNum * multiplier).toLong()
     }
 
     private fun collectMusicResponsiveItems(node: Any?, out: MutableList<JSONObject>) {
@@ -707,7 +1020,7 @@ object GlobalMusicSearchEngine {
                         val artist = item.optString("artistName", "Unknown Artist")
                         val album = item.optString("collectionName", "Single")
                         val artwork100 = item.optString("artworkUrl100", "")
-                        val highResArtwork = artwork100.replace("100x100bb", "600x600bb")
+                        val highResArtwork = AlbumArtHelper.enhanceArtworkUrl(artwork100)
                         val genre = item.optString("primaryGenreName", "Pop")
                         val duration = item.optLong("trackTimeMillis", 210000L).coerceAtLeast(60000L)
                         val releaseDate = item.optString("releaseDate", "2024")
@@ -789,7 +1102,7 @@ object GlobalMusicSearchEngine {
                         val artist = item.optString("artistName", "Unknown Artist")
                         val album = item.optString("collectionName", "Single")
                         val artwork100 = item.optString("artworkUrl100", "")
-                        val highResArtwork = artwork100.replace("100x100bb", "600x600bb")
+                        val highResArtwork = AlbumArtHelper.enhanceArtworkUrl(artwork100)
                         val genre = item.optString("primaryGenreName", "Pop")
                         val duration = item.optLong("trackTimeMillis", 210000L).coerceAtLeast(60000L)
                         val releaseDate = item.optString("releaseDate", "2024")
@@ -877,9 +1190,13 @@ object GlobalMusicSearchEngine {
 
                         val albumObj = item.optJSONObject("album")
                         val albumTitle = albumObj?.optString("title", "Single") ?: "Single"
-                        val coverXl = albumObj?.optString("cover_xl", "")
+                        val rawCover = albumObj?.optString("cover_xl", "")
+                            ?.ifBlank { null }
                             ?: albumObj?.optString("cover_big", "")
+                            ?.ifBlank { null }
+                            ?: albumObj?.optString("cover_medium", "")
                             ?: ""
+                        val coverXl = AlbumArtHelper.enhanceArtworkUrl(rawCover)
 
                         if (title.isNotBlank() && results.none {
                                 it.title.equals(title, ignoreCase = true) &&

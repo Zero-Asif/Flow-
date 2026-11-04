@@ -37,9 +37,13 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 import com.example.download.SongDownloadManager
+import com.example.network.CategorizedSearchResults
+import com.example.network.ResolvedStreamCandidate
 import com.example.network.DownloadQualityOption
 import com.example.network.GlobalMusicSearchEngine
 import com.example.network.MusicSourceFilter
+import com.example.network.SearchSuggestionsResult
+import com.example.network.TrackRadioRepository
 
 class MusicViewModel(application: Application) : AndroidViewModel(application) {
     val repository = MusicRepository(application.applicationContext)
@@ -124,6 +128,10 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     private val _selectedStreamBackend = MutableStateFlow(StreamBackend.AUTO_HIGH_FIDELITY)
     val selectedStreamBackend: StateFlow<StreamBackend> = _selectedStreamBackend.asStateFlow()
 
+    // Real candidate stream switching (Deezer HiFi FLAC, Amazon Ultra HD, Tidal Master, JioSaavn 320k)
+    val activeStreamCandidate: StateFlow<ResolvedStreamCandidate?> = audioEngine.activeStreamCandidate
+    val availableStreamCandidates: StateFlow<List<ResolvedStreamCandidate>> = audioEngine.availableStreamCandidates
+
     private var lyricsJob: Job? = null
 
     // Search filters
@@ -142,7 +150,13 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     private val _globalTrendingTracks = MutableStateFlow<List<AudioTrack>>(emptyList())
     val globalTrendingTracks: StateFlow<List<AudioTrack>> = _globalTrendingTracks.asStateFlow()
 
+    private val _searchSuggestions = MutableStateFlow(SearchSuggestionsResult())
+    val searchSuggestions: StateFlow<SearchSuggestionsResult> = _searchSuggestions.asStateFlow()
+
     private var searchJob: Job? = null
+    private var isRadioMode: Boolean = true
+    private var isFetchingRadioBatch: Boolean = false
+    private var radioJob: Job? = null
 
     // Combined filtered search results (Local tracks + Global songs across the world)
     private val rawSearchResults: StateFlow<List<AudioTrack>> = combine(
@@ -155,14 +169,14 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             val matchingLocal = localTracks.filter { track ->
                 track.title.contains(trimmedQuery, ignoreCase = true) ||
                     track.artist.contains(trimmedQuery, ignoreCase = true) ||
-                    track.album.contains(trimmedQuery, ignoreCase = true)
+                    track.album.contains(trimmedQuery, ignoreCase = true) ||
+                    GlobalMusicSearchEngine.computeSearchRelevanceScore(track, trimmedQuery) >= 62
             }
             val deduplicatedGlobal = globalTracks.filter { gTrack ->
                 matchingLocal.none { it.id == gTrack.id }
             }
-            // Sort combined results by Bit Depth -> Sample Rate -> Bitrate -> Provider Hierarchy
-            // so the #1 highest quality stream is always displayed at the top of search results
-            GlobalMusicSearchEngine.sortTracksByQualityCascade(matchingLocal + deduplicatedGlobal)
+            // Rank combined results by Fuzzy Relevance Score + Lossless Quality Cascade
+            GlobalMusicSearchEngine.rankTracksByQueryAndQuality(matchingLocal + deduplicatedGlobal, trimmedQuery)
         } else {
             localTracks
         }
@@ -181,6 +195,17 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             matchesGenre && matchesFormat && matchesYear
         }
     }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    val categorizedSearchResults: StateFlow<CategorizedSearchResults> = combine(
+        searchResults,
+        searchQuery
+    ) { results, query ->
+        if (query.isNotBlank()) {
+            GlobalMusicSearchEngine.segregateSearchResults(results, query)
+        } else {
+            CategorizedSearchResults()
+        }
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, CategorizedSearchResults())
 
     private var sleepTimerJob: Job? = null
 
@@ -248,6 +273,9 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
         audioEngine.onFavoriteToggleRequested = { track ->
             toggleFavorite(track.id)
+        }
+        audioEngine.onQueueNearEnd = {
+            fetchNextRadioBatch()
         }
 
         audioEngine.setEqualizerPreset(_activePreset.value)
@@ -318,7 +346,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * Debounced Search State Manager (350ms debounce):
+     * Debounced Search State Manager (250ms debounce per Module 2.1):
      * - Cancels any in-flight OkHttp API calls and active search coroutine immediately.
      * - Clears stale global search list state so old results never linger or desync.
      */
@@ -330,6 +358,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         val trimmed = newQuery.trim()
         if (trimmed.isEmpty()) {
             _globalSearchResults.value = emptyList()
+            _searchSuggestions.value = SearchSuggestionsResult()
             _isGlobalSearching.value = false
             return
         }
@@ -347,8 +376,8 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         searchJob = viewModelScope.launch {
             _isGlobalSearching.value = true
             _globalSearchResults.value = emptyList()
-            // 350ms debounce window (within 300ms-500ms requirement)
-            delay(350L)
+            // 250ms debounce window per Amazon / YouTube Music typeahead specification
+            delay(250L)
             if (!isActive) return@launch
             try {
                 val results = GlobalMusicSearchEngine.searchAllSources(
@@ -357,6 +386,10 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                 )
                 if (isActive && searchQuery.value.trim().equals(query.trim(), ignoreCase = true)) {
                     _globalSearchResults.value = results
+                    val suggestions = GlobalMusicSearchEngine.fetchAutocompleteSuggestions(query, results)
+                    if (isActive) {
+                        _searchSuggestions.value = suggestions
+                    }
                 }
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
@@ -420,7 +453,10 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     fun playTrack(track: AudioTrack, queue: List<AudioTrack> = emptyList()) {
         ensureServiceStarted()
 
-        val baseQueue = if (queue.isNotEmpty()) queue else listOf(track)
+        val isSingleSelection = queue.isEmpty() || queue.size == 1
+        isRadioMode = isSingleSelection
+
+        val baseQueue = if (isSingleSelection) listOf(track) else queue
         val newQueue = if (baseQueue.any { it.id == track.id }) {
             baseQueue
         } else {
@@ -431,11 +467,76 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         // Do NOT update currentTrack or mini-player state until audioEngine confirms STATE_READY for the new track URL.
         _playbackState.value = _playbackState.value.copy(
             isPlaying = false,
-            currentPositionMs = 0L
+            currentPositionMs = 0L,
+            queue = newQueue,
+            queueIndex = 0
         )
 
         // Delegate atomic stop -> reset -> resolve highest bitrate -> STATE_READY -> emit UI state -> play
         audioEngine.playTrack(track, newQueue, _selectedStreamBackend.value)
+
+        // Smart Dynamic Track Radio Generation:
+        // When played as a standalone seed track from search, do NOT feed the remaining search results.
+        // Instead, asynchronously populate "Up Next" with 15-20 contextually related songs
+        // (similar artists, tempo, genre) — strictly excluding duplicate titles or remixes of the seed track!
+        if (isSingleSelection) {
+            radioJob?.cancel()
+            radioJob = viewModelScope.launch {
+                try {
+                    val similarTracks = TrackRadioRepository.generateTrackRadio(
+                        seedTrack = track,
+                        limit = 20,
+                        excludedTrackIds = setOf(track.id)
+                    )
+                    if (isActive && similarTracks.isNotEmpty()) {
+                        val currentQ = _playbackState.value.queue
+                        val existingIds = currentQ.map { it.id }.toSet()
+                        val filteredNew = similarTracks.filter { it.id !in existingIds }
+                        val expandedQueue = currentQ + filteredNew
+                        _playbackState.value = _playbackState.value.copy(queue = expandedQueue)
+                        audioEngine.updateQueue(expandedQueue)
+                    }
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+            }
+        }
+    }
+
+    /**
+     * Infinite Auto-Play Radio:
+     * When queue has <= 3 tracks left in Radio mode, automatically fetch the next batch
+     * of contextually related tracks to maintain infinite playback without repetitive loops.
+     */
+    fun fetchNextRadioBatch() {
+        if (!isRadioMode || isFetchingRadioBatch) return
+        val currentQueue = _playbackState.value.queue
+        if (currentQueue.isEmpty()) return
+        val seed = _playbackState.value.currentTrack ?: currentQueue.last()
+
+        isFetchingRadioBatch = true
+        viewModelScope.launch {
+            try {
+                val existingIds = currentQueue.map { it.id }.toSet()
+                val nextBatch = TrackRadioRepository.generateTrackRadio(
+                    seedTrack = seed,
+                    limit = 15,
+                    excludedTrackIds = existingIds
+                )
+                if (isActive && nextBatch.isNotEmpty()) {
+                    val freshItems = nextBatch.filter { it.id !in existingIds }
+                    if (freshItems.isNotEmpty()) {
+                        val expanded = _playbackState.value.queue + freshItems
+                        _playbackState.value = _playbackState.value.copy(queue = expanded)
+                        audioEngine.updateQueue(expanded)
+                    }
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            } finally {
+                isFetchingRadioBatch = false
+            }
+        }
     }
 
     fun togglePlayPause() {
@@ -504,6 +605,14 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         if (curr != null) {
             audioEngine.playTrack(curr, _playbackState.value.queue, backend)
         }
+    }
+
+    fun cycleStreamCandidate() {
+        audioEngine.cycleStreamCandidate()
+    }
+
+    fun selectStreamCandidate(candidate: ResolvedStreamCandidate) {
+        audioEngine.selectStreamCandidate(candidate)
     }
 
     fun playNext() {

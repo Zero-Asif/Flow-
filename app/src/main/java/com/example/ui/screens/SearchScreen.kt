@@ -4,6 +4,7 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
+import androidx.compose.foundation.basicMarquee
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -70,7 +71,10 @@ import com.example.ui.theme.TextSecondaryDark
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.DownloadDone
+import com.example.network.CategorizedSearchResults
 import com.example.network.MusicSourceFilter
+import com.example.network.SearchSuggestionsResult
+import com.example.util.AlbumArtHelper
 
 @Composable
 fun SearchScreen(
@@ -88,6 +92,8 @@ fun SearchScreen(
     downloadedTrackIds: Set<String> = emptySet(),
     onDownloadTrack: (AudioTrack) -> Unit = {},
     searchResults: List<AudioTrack>,
+    searchSuggestions: SearchSuggestionsResult = SearchSuggestionsResult(),
+    categorizedResults: CategorizedSearchResults = CategorizedSearchResults(),
     isGlobalSearching: Boolean = false,
     globalTrendingTracks: List<AudioTrack> = emptyList(),
     onPlayTrack: (AudioTrack, List<AudioTrack>) -> Unit,
@@ -115,18 +121,26 @@ fun SearchScreen(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
-            Column {
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .padding(end = 12.dp)
+            ) {
                 Text(
                     text = "Global Music Search",
                     style = MaterialTheme.typography.titleLarge.copy(
                         fontWeight = FontWeight.Black,
                         color = TextPrimaryDark
-                    )
+                    ),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
                 Text(
                     text = "Search all songs, artists & albums in the world",
                     fontSize = 12.sp,
-                    color = TextSecondaryDark
+                    color = TextSecondaryDark,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
             }
 
@@ -134,22 +148,27 @@ fun SearchScreen(
                 modifier = Modifier
                     .clip(RoundedCornerShape(12.dp))
                     .background(DeezerPurplePrimary.copy(alpha = 0.2f))
-                    .padding(horizontal = 8.dp, vertical = 4.dp),
+                    .padding(horizontal = 12.dp, vertical = 6.dp),
                 contentAlignment = Alignment.Center
             ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
                     Icon(
                         imageVector = Icons.Default.Public,
                         contentDescription = null,
                         tint = CyberCyan,
                         modifier = Modifier.size(14.dp)
                     )
-                    Spacer(modifier = Modifier.width(4.dp))
                     Text(
                         text = "WORLDWIDE",
                         fontSize = 10.sp,
                         fontWeight = FontWeight.ExtraBold,
-                        color = CyberCyan
+                        color = CyberCyan,
+                        maxLines = 1,
+                        softWrap = false,
+                        letterSpacing = 0.5.sp
                     )
                 }
             }
@@ -214,6 +233,43 @@ fun SearchScreen(
                     color = CyberCyan,
                     modifier = Modifier.padding(horizontal = 20.dp, vertical = 2.dp)
                 )
+            }
+        }
+
+        // Real-Time Typeahead Autocomplete Suggestions (Query Completions & Top Artist Suggestions)
+        if (query.isNotBlank() && (searchSuggestions.queryCompletions.isNotEmpty() || searchSuggestions.topArtists.isNotEmpty())) {
+            LazyRow(
+                contentPadding = PaddingValues(horizontal = 20.dp, vertical = 4.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                val combinedSuggestions = (searchSuggestions.topArtists + searchSuggestions.queryCompletions).distinct().take(8)
+                items(combinedSuggestions) { suggestion ->
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(14.dp))
+                            .background(DeezerPurplePrimary.copy(alpha = 0.22f))
+                            .clickable { onQueryChange(suggestion) }
+                            .padding(horizontal = 10.dp, vertical = 5.dp)
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Default.Search,
+                                contentDescription = null,
+                                tint = CyberCyan,
+                                modifier = Modifier.size(12.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = suggestion,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = TextPrimaryDark,
+                                maxLines = 1
+                            )
+                        }
+                    }
+                }
             }
         }
 
@@ -539,6 +595,152 @@ fun SearchScreen(
                     }
                 }
             } else {
+                // Segregated Search Sections (Amazon / YouTube Music Standard: Best Match, Artists, Albums, Songs)
+                val bestMatch = categorizedResults.bestMatch
+                if (query.isNotBlank() && bestMatch != null) {
+                    item(key = "best_match_header") {
+                        Text(
+                            text = "BEST MATCH (TOP RESULT)",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.ExtraBold,
+                            color = HiResGold,
+                            letterSpacing = 1.sp,
+                            modifier = Modifier.padding(top = 4.dp)
+                        )
+                    }
+                    item(key = "best_match_${bestMatch.id}") {
+                        val isDownloaded = bestMatch.isDownloaded || downloadedTrackIds.contains(bestMatch.id)
+                        val progress = downloadProgress[bestMatch.id]
+                        SearchResultItem(
+                            track = bestMatch,
+                            isDownloaded = isDownloaded,
+                            downloadProgress = progress,
+                            onDownloadTrack = { onDownloadTrack(bestMatch) },
+                            onClick = { onPlayTrack(bestMatch, listOf(bestMatch)) },
+                            onToggleFavorite = { onToggleFavorite(bestMatch.id) }
+                        )
+                    }
+                }
+
+                if (query.isNotBlank() && (categorizedResults.artists.isNotEmpty() || categorizedResults.albums.isNotEmpty())) {
+                    item(key = "artists_albums_segregated_row") {
+                        Column(modifier = Modifier.padding(vertical = 4.dp)) {
+                            if (categorizedResults.artists.isNotEmpty()) {
+                                Text(
+                                    text = "ARTISTS",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.ExtraBold,
+                                    color = CyberCyan,
+                                    letterSpacing = 1.sp
+                                )
+                                Spacer(modifier = Modifier.height(4.dp))
+                                LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    items(categorizedResults.artists, key = { "artist_${it.name}" }) { artistSummary ->
+                                        Box(
+                                            modifier = Modifier
+                                                .clip(RoundedCornerShape(14.dp))
+                                                .background(SurfaceDarkElevated)
+                                                .clickable { onQueryChange(artistSummary.name) }
+                                                .padding(horizontal = 12.dp, vertical = 8.dp)
+                                        ) {
+                                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                                if (!artistSummary.artworkUrl.isNullOrBlank()) {
+                                                    AsyncImage(
+                                                        model = AlbumArtHelper.enhanceArtworkUrl(artistSummary.artworkUrl),
+                                                        contentDescription = artistSummary.name,
+                                                        contentScale = ContentScale.Crop,
+                                                        modifier = Modifier
+                                                            .size(28.dp)
+                                                            .clip(CircleShape)
+                                                    )
+                                                    Spacer(modifier = Modifier.width(8.dp))
+                                                }
+                                                Column {
+                                                    Text(
+                                                        text = artistSummary.name,
+                                                        fontSize = 12.sp,
+                                                        fontWeight = FontWeight.Bold,
+                                                        color = TextPrimaryDark,
+                                                        maxLines = 1
+                                                    )
+                                                    Text(
+                                                        text = artistSummary.topGenre,
+                                                        fontSize = 10.sp,
+                                                        color = TextSecondaryDark
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Spacer(modifier = Modifier.height(8.dp))
+                            }
+
+                            if (categorizedResults.albums.isNotEmpty()) {
+                                Text(
+                                    text = "ALBUMS",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.ExtraBold,
+                                    color = DeezerPinkAccent,
+                                    letterSpacing = 1.sp
+                                )
+                                Spacer(modifier = Modifier.height(4.dp))
+                                LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    items(categorizedResults.albums, key = { "album_${it.title}_${it.artist}" }) { albumSummary ->
+                                        Box(
+                                            modifier = Modifier
+                                                .clip(RoundedCornerShape(12.dp))
+                                                .background(SurfaceDarkElevated)
+                                                .clickable { onPlayTrack(albumSummary.representativeTrack, listOf(albumSummary.representativeTrack)) }
+                                                .padding(horizontal = 10.dp, vertical = 8.dp)
+                                        ) {
+                                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                                if (!albumSummary.artworkUrl.isNullOrBlank()) {
+                                                    AsyncImage(
+                                                        model = AlbumArtHelper.enhanceArtworkUrl(albumSummary.artworkUrl),
+                                                        contentDescription = albumSummary.title,
+                                                        contentScale = ContentScale.Crop,
+                                                        modifier = Modifier
+                                                            .size(32.dp)
+                                                            .clip(RoundedCornerShape(6.dp))
+                                                    )
+                                                    Spacer(modifier = Modifier.width(8.dp))
+                                                }
+                                                Column {
+                                                    Text(
+                                                        text = albumSummary.title,
+                                                        fontSize = 12.sp,
+                                                        fontWeight = FontWeight.Bold,
+                                                        color = TextPrimaryDark,
+                                                        maxLines = 1
+                                                    )
+                                                    Text(
+                                                        text = albumSummary.artist,
+                                                        fontSize = 10.sp,
+                                                        color = TextSecondaryDark,
+                                                        maxLines = 1
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    item(key = "songs_section_header") {
+                        Text(
+                            text = "SONGS",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.ExtraBold,
+                            color = TextSecondaryDark,
+                            letterSpacing = 1.sp,
+                            modifier = Modifier.padding(top = 4.dp)
+                        )
+                    }
+                }
+
                 items(
                     items = searchResults,
                     key = { track -> track.id }
@@ -580,7 +782,7 @@ fun SearchResultItem(
         // Thumbnail with AsyncImage or Lossless Gradient
         if (!track.artworkUrl.isNullOrBlank()) {
             AsyncImage(
-                model = track.artworkUrl,
+                model = AlbumArtHelper.enhanceArtworkUrl(track.artworkUrl),
                 contentDescription = track.title,
                 contentScale = ContentScale.Crop,
                 modifier = Modifier
@@ -614,7 +816,15 @@ fun SearchResultItem(
                 fontWeight = FontWeight.Bold,
                 color = TextPrimaryDark,
                 maxLines = 1,
-                overflow = TextOverflow.Ellipsis
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .basicMarquee(
+                        iterations = Int.MAX_VALUE,
+                        initialDelayMillis = 1500,
+                        repeatDelayMillis = 1500,
+                        velocity = 30.dp
+                    )
             )
 
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -624,7 +834,14 @@ fun SearchResultItem(
                     color = TextSecondaryDark,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f, fill = false)
+                    modifier = Modifier
+                        .weight(1f, fill = false)
+                        .basicMarquee(
+                            iterations = Int.MAX_VALUE,
+                            initialDelayMillis = 1500,
+                            repeatDelayMillis = 1500,
+                            velocity = 30.dp
+                        )
                 )
                 Spacer(modifier = Modifier.width(6.dp))
                 // Dynamic Quality & Bitrate badge

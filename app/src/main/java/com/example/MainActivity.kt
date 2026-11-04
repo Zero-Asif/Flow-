@@ -75,6 +75,7 @@ import com.example.viewmodel.MusicViewModel
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        window.setFormat(android.graphics.PixelFormat.RGBA_8888)
         enableEdgeToEdge()
         setContent {
             FlowMusicTheme {
@@ -133,6 +134,8 @@ fun MainAppContent(viewModel: MusicViewModel = viewModel()) {
     val filterFormat by viewModel.filterFormat.collectAsStateWithLifecycle()
     val filterYear by viewModel.filterYear.collectAsStateWithLifecycle()
     val searchResults by viewModel.searchResults.collectAsStateWithLifecycle()
+    val searchSuggestions by viewModel.searchSuggestions.collectAsStateWithLifecycle()
+    val categorizedSearchResults by viewModel.categorizedSearchResults.collectAsStateWithLifecycle()
     val isGlobalSearching by viewModel.isGlobalSearching.collectAsStateWithLifecycle()
     val globalTrendingTracks by viewModel.globalTrendingTracks.collectAsStateWithLifecycle()
 
@@ -147,6 +150,7 @@ fun MainAppContent(viewModel: MusicViewModel = viewModel()) {
     val pendingDownloadTrack by viewModel.pendingDownloadTrack.collectAsStateWithLifecycle()
     val selectedMusicSourceFilter by viewModel.selectedMusicSourceFilter.collectAsStateWithLifecycle()
     val playbackError by viewModel.playbackError.collectAsStateWithLifecycle()
+    val activeStreamCandidate by viewModel.activeStreamCandidate.collectAsStateWithLifecycle()
 
     Box(modifier = Modifier.fillMaxSize().background(SurfaceDarkVoid)) {
         Scaffold(
@@ -236,6 +240,8 @@ fun MainAppContent(viewModel: MusicViewModel = viewModel()) {
                         downloadedTrackIds = downloadedTracks.map { it.id }.toSet(),
                         onDownloadTrack = { viewModel.requestDownloadTrack(it) },
                         searchResults = searchResults,
+                        searchSuggestions = searchSuggestions,
+                        categorizedResults = categorizedSearchResults,
                         isGlobalSearching = isGlobalSearching,
                         globalTrendingTracks = globalTrendingTracks,
                         onPlayTrack = { track, q -> viewModel.playTrack(track, q) },
@@ -299,6 +305,7 @@ fun MainAppContent(viewModel: MusicViewModel = viewModel()) {
                 audioQualityInfo = audioQualityInfo,
                 badgeDisplayMode = badgeDisplayMode,
                 streamBackend = selectedStreamBackend,
+                activeStreamCandidateName = activeStreamCandidate?.providerName,
                 lyrics = activeLyrics,
                 lyricsSyncState = lyricsSyncState,
                 lyricsDisplayMode = lyricsDisplayMode,
@@ -308,6 +315,7 @@ fun MainAppContent(viewModel: MusicViewModel = viewModel()) {
                     val nextIdx = (backends.indexOf(selectedStreamBackend) + 1) % backends.size
                     viewModel.setStreamBackend(backends[nextIdx])
                 },
+                onCycleStreamCandidate = { viewModel.cycleStreamCandidate() },
                 onCycleLyricsMode = { viewModel.cycleLyricsDisplayMode() },
                 onTogglePlay = { viewModel.togglePlayPause() },
                 onNext = { viewModel.playNext() },
@@ -383,31 +391,6 @@ fun MainAppContent(viewModel: MusicViewModel = viewModel()) {
                     viewModel.repository.createPlaylist(name, desc, emptyList())
                 },
                 onDismiss = { viewModel.setShowCreatePlaylistDialog(false) }
-            )
-        }
-
-        // Explicit Stream Resolution Error Alert (never silently plays previous/wrong song)
-        playbackError?.let { errorMsg ->
-            AlertDialog(
-                onDismissRequest = { viewModel.dismissPlaybackError() },
-                containerColor = SurfaceDarkElevated,
-                title = {
-                    Text(
-                        text = "Stream Resolution Failed",
-                        color = TextPrimaryDark
-                    )
-                },
-                text = {
-                    Text(
-                        text = errorMsg,
-                        color = TextSecondaryDark
-                    )
-                },
-                confirmButton = {
-                    TextButton(onClick = { viewModel.dismissPlaybackError() }) {
-                        Text("OK", color = DeezerPinkAccent)
-                    }
-                }
             )
         }
     }

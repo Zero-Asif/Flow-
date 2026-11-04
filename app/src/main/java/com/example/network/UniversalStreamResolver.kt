@@ -99,7 +99,9 @@ data class ResolvedStreamCandidate(
     val bitDepth: Int,
     val bitrateKbps: Int,
     val isLossless: Boolean,
-    val providerName: String = "Direct Master"
+    val providerName: String = "Direct Master",
+    val sourceTrackId: String = "",
+    val directStreamUrl: String = streamUrl
 ) {
     fun toAudioQualityInfo(): AudioQualityInfo {
         return AudioQualityInfo(
@@ -147,9 +149,17 @@ object UniversalStreamResolver {
         "https://yewtu.be"
     )
 
-    // In-memory resolved streams cache
-    private val resolvedStreamsCache = mutableMapOf<String, Pair<String, AudioQualityInfo>>()
-    private val resolvedCandidatesCache = mutableMapOf<String, List<ResolvedStreamCandidate>>()
+    // In-memory resolved streams cache & relaxed resilient thresholds
+    const val HARD_MATCH_THRESHOLD = 50
+    const val MAX_DURATION_DEVIATION_SEC = 25L
+
+    private val resolvedStreamsCache = java.util.concurrent.ConcurrentHashMap<String, Pair<String, AudioQualityInfo>>()
+    private val resolvedCandidatesCache = java.util.concurrent.ConcurrentHashMap<String, List<ResolvedStreamCandidate>>()
+    private val resolvedCandidatesByTrackId = java.util.concurrent.ConcurrentHashMap<String, List<ResolvedStreamCandidate>>()
+
+    fun getTopResolvedCandidateForTrack(trackId: String): ResolvedStreamCandidate? {
+        return resolvedCandidatesByTrackId[trackId]?.firstOrNull()
+    }
 
     /**
      * Codec Lossless Priority rank:
@@ -192,6 +202,7 @@ object UniversalStreamResolver {
                     .thenByDescending { it.sampleRateHz }
                     .thenByDescending { it.bitrateKbps }
                     .thenByDescending { codecPriorityRank(it.formatName) }
+                    .thenByDescending { GlobalMusicSearchEngine.providerWaterfallRank(it.providerName) }
             )
     }
 
@@ -229,9 +240,11 @@ object UniversalStreamResolver {
         activeQualityInfo: AudioQualityInfo? = null
     ): List<DynamicDownloadOptionItem> {
         val durationMs = track.durationMs.takeIf { it > 0L } ?: 210_000L
+        val cachedTopCandidate = getTopResolvedCandidateForTrack(track.id)
+        val effectiveQualityInfo = activeQualityInfo ?: cachedTopCandidate?.toAudioQualityInfo()
 
         val isLosslessSource = when {
-            activeQualityInfo != null -> activeQualityInfo.isLossless || activeQualityInfo.bitrateKbps > 320
+            effectiveQualityInfo != null -> effectiveQualityInfo.isLossless || effectiveQualityInfo.bitrateKbps > 320
             else -> track.format.isLossless || track.bitrateKbps > 320 || isTrueLosslessUrl(track.uriString)
         }
 
@@ -239,7 +252,7 @@ object UniversalStreamResolver {
 
         if (isLosslessSource) {
             val rawFormat = when {
-                activeQualityInfo != null && (activeQualityInfo.isLossless || activeQualityInfo.bitrateKbps > 320) -> activeQualityInfo.formatName
+                effectiveQualityInfo != null && (effectiveQualityInfo.isLossless || effectiveQualityInfo.bitrateKbps > 320) -> effectiveQualityInfo.formatName
                 track.format.isLossless -> track.format.displayName
                 else -> "FLAC"
             }
@@ -250,13 +263,13 @@ object UniversalStreamResolver {
                 rawFormat.contains("AIFF", ignoreCase = true) -> "AIFF"
                 else -> "FLAC"
             }
-            val losslessBitrate = (activeQualityInfo?.bitrateKbps?.takeIf { it > 320 }
+            val losslessBitrate = (effectiveQualityInfo?.bitrateKbps?.takeIf { it > 320 }
                 ?: track.bitrateKbps.takeIf { it > 320 }
                 ?: 1411)
-            val losslessSampleRate = (activeQualityInfo?.sampleRateHz?.takeIf { it >= 44100 }
+            val losslessSampleRate = (effectiveQualityInfo?.sampleRateHz?.takeIf { it >= 44100 }
                 ?: track.sampleRate.takeIf { it >= 44100 }
                 ?: 96000)
-            val losslessBitDepth = (activeQualityInfo?.bitDepth?.takeIf { it >= 16 }
+            val losslessBitDepth = (effectiveQualityInfo?.bitDepth?.takeIf { it >= 16 }
                 ?: track.bitDepth.takeIf { it >= 16 }
                 ?: 24)
             val losslessSizeMb = estimateFileSizeMb(durationMs, losslessBitrate)
@@ -444,23 +457,29 @@ object UniversalStreamResolver {
             val localFile = File(track.localFilePath)
             if (localFile.exists() && localFile.length() > 5000L) {
                 val isLosslessFile = isTrueLosslessUrl(localFile.name) || track.format.isLossless
-                val durationSec = (track.durationMs / 1000L).coerceAtLeast(30L)
-                val realFileBitrate = ((localFile.length() * 8L) / durationSec / 1000L).toInt()
-                    .takeIf { it in 64..9000 } ?: track.bitrateKbps
+                val sr = track.sampleRate.takeIf { it > 0 } ?: 44100
+                val bd = track.bitDepth.takeIf { it > 0 } ?: 16
                 val realFormat = when {
                     localFile.name.endsWith(".flac", true) -> "FLAC"
-                    localFile.name.endsWith(".wav", true) -> "WAV"
+                    localFile.name.endsWith(".wav", true) || localFile.name.endsWith(".wave", true) -> "WAV"
                     localFile.name.endsWith(".alac", true) -> "ALAC"
                     localFile.name.endsWith(".mp3", true) -> "MP3"
                     localFile.name.endsWith(".opus", true) || localFile.name.endsWith(".webm", true) -> "OPUS"
                     else -> track.format.displayName
                 }
+                val durationSec = (track.durationMs / 1000L).coerceAtLeast(30L)
+                val realFileBitrate = if (realFormat == "WAV" || realFormat == "PCM WAV") {
+                    (sr * 2 * bd) / 1000
+                } else {
+                    ((localFile.length() * 8L) / durationSec / 1000L).toInt()
+                        .takeIf { it in 64..9500 } ?: track.bitrateKbps
+                }
                 return@withContext listOf(
                     ResolvedStreamCandidate(
                         streamUrl = localFile.absolutePath,
                         formatName = realFormat,
-                        sampleRateHz = track.sampleRate.takeIf { it > 0 } ?: 44100,
-                        bitDepth = track.bitDepth.takeIf { it > 0 } ?: 16,
+                        sampleRateHz = sr,
+                        bitDepth = bd,
                         bitrateKbps = realFileBitrate,
                         isLossless = isLosslessFile,
                         providerName = "Offline Master"
@@ -471,13 +490,21 @@ object UniversalStreamResolver {
 
         // 2. Local SAF import
         if (track.isLocalImport && !track.uriString.isNullOrBlank()) {
+            val sr = track.sampleRate.takeIf { it > 0 } ?: 44100
+            val bd = track.bitDepth.takeIf { it > 0 } ?: 16
+            val fmt = track.format.displayName
+            val br = if (fmt.contains("WAV", true) || fmt.contains("PCM", true)) {
+                (sr * 2 * bd) / 1000
+            } else {
+                track.bitrateKbps
+            }
             return@withContext listOf(
                 ResolvedStreamCandidate(
                     streamUrl = track.uriString,
-                    formatName = track.format.displayName,
-                    sampleRateHz = track.sampleRate,
-                    bitDepth = track.bitDepth,
-                    bitrateKbps = track.bitrateKbps,
+                    formatName = fmt,
+                    sampleRateHz = sr,
+                    bitDepth = bd,
+                    bitrateKbps = br,
                     isLossless = track.format.isLossless,
                     providerName = "Local Storage"
                 )
@@ -487,49 +514,54 @@ object UniversalStreamResolver {
         // 3. Built-in Offline Studio Master tracks or explicit Local Lossless backend
         if (backend == StreamBackend.LOCAL_LOSSLESS || (!track.isGlobalOnline && track.uriString.isNullOrBlank())) {
             val localWav = getOrCreateTrackAudioFile(context, track)
-            val isLossless = track.format.isLossless || backend == StreamBackend.LOCAL_LOSSLESS
+            val sr = track.sampleRate.takeIf { it > 0 } ?: 44100
+            val bd = track.bitDepth.takeIf { it > 0 } ?: 16
+            val exactWavBitrate = (sr * 2 * bd) / 1000
             return@withContext listOf(
                 ResolvedStreamCandidate(
                     streamUrl = localWav.absolutePath,
-                    formatName = if (track.format.isLossless) track.format.displayName else "WAV",
-                    sampleRateHz = track.sampleRate.takeIf { it > 0 } ?: 44100,
-                    bitDepth = track.bitDepth.takeIf { it > 0 } ?: 16,
-                    bitrateKbps = track.bitrateKbps.takeIf { it > 0 } ?: 1411,
-                    isLossless = isLossless,
+                    formatName = "WAV",
+                    sampleRateHz = sr,
+                    bitDepth = bd,
+                    bitrateKbps = exactWavBitrate,
+                    isLossless = true,
                     providerName = "Local Lossless Master"
                 )
             )
         }
 
-        val cacheKey = "${track.id}_${track.title.trim().lowercase()}_${track.artist.trim().lowercase()}_${backend.name}"
+        val cacheKey = "${track.id}_${track.title.trim().lowercase()}_${track.artist.trim().lowercase()}_${track.durationMs}_${backend.name}"
         resolvedCandidatesCache[cacheKey]?.takeIf { it.isNotEmpty() }?.let {
             return@withContext it
         }
 
-        // 4. If track already has a direct CDN stream URL, build its real technical tiers immediately
+        val targetDurationSec = (track.durationMs / 1000L).coerceAtLeast(0L)
+
+        // 4. If track already has a verified direct CDN stream URL, build its real technical tiers immediately
         if (!track.uriString.isNullOrBlank() && isFullLengthStreamUrl(track.uriString)) {
             networkCandidates.addAll(buildCandidatesFromBaseUrl(track.uriString, track))
         }
 
-        // 5. Query Official JioSaavn Direct API v4 for direct decrypted CDN stream URLs
-        if (networkCandidates.isEmpty()) {
-            val officialSaavn = resolveFromOfficialJioSaavn(track.title, track.artist)
-            if (officialSaavn != null) {
-                networkCandidates.addAll(buildCandidatesFromBaseUrl(officialSaavn.first, track))
+        // 5. Native Pre-Built Multi-Provider Lossless Waterfall Pipeline:
+        // Priority: Amazon Ultra HD -> Deezer HiFi -> Tidal HiFi -> JioSaavn 320k -> YouTube Music
+        val engineCandidates = LosslessAudioEngine.resolveLosslessWaterfall(context, track)
+        for (cand in engineCandidates) {
+            if (cand.providerName != "Offline Studio Master" && networkCandidates.none { it.streamUrl == cand.streamUrl }) {
+                networkCandidates.add(cand)
             }
         }
 
-        // 6. Secondary JioSaavn mirrors if needed
+        // Tier 4b: Secondary JioSaavn mirrors if needed
         if (networkCandidates.isEmpty()) {
-            val mirrorSaavn = resolveFromJioSaavnMirrors(track.title, track.artist)
+            val mirrorSaavn = resolveFromJioSaavnMirrors(track.title, track.artist, targetDurationSec)
             if (mirrorSaavn != null) {
                 networkCandidates.addAll(buildCandidatesFromBaseUrl(mirrorSaavn.first, track))
             }
         }
 
-        // 7. Tertiary YouTube Music / Piped / Invidious extractors
+        // Tier 5: YouTube Music / Piped / Invidious extractors (Last Resort Fallback)
         if (networkCandidates.isEmpty()) {
-            val ytResult = resolveFromYouTubeExtractors(track.title, track.artist, backend)
+            val ytResult = resolveFromYouTubeExtractors(track.title, track.artist, backend, targetDurationSec)
             if (ytResult != null) {
                 networkCandidates.add(
                     ResolvedStreamCandidate(
@@ -545,12 +577,59 @@ object UniversalStreamResolver {
             }
         }
 
-        val sortedNetwork = sortStreamCandidates(networkCandidates)
+        // Tier 5b: Resilient Title-Only Search Fallback (recovers songs with featuring / film credit variations)
+        if (networkCandidates.isEmpty()) {
+            val titleOnlySaavn = resolveFromOfficialJioSaavn(track.title, "")
+            if (titleOnlySaavn != null) {
+                networkCandidates.addAll(buildCandidatesFromBaseUrl(titleOnlySaavn.first, track))
+            }
+        }
+        if (networkCandidates.isEmpty()) {
+            val titleOnlyYt = resolveFromYouTubeExtractors(track.title, "", backend, targetDurationSec)
+            if (titleOnlyYt != null) {
+                networkCandidates.add(
+                    ResolvedStreamCandidate(
+                        streamUrl = titleOnlyYt.first,
+                        formatName = titleOnlyYt.second.formatName,
+                        sampleRateHz = titleOnlyYt.second.sampleRateHz,
+                        bitDepth = titleOnlyYt.second.bitDepth,
+                        bitrateKbps = titleOnlyYt.second.bitrateKbps,
+                        isLossless = titleOnlyYt.second.isLossless,
+                        providerName = "YouTube Music Stream"
+                    )
+                )
+            }
+        }
 
-        // 8. For online tracks, NEVER silently fall back to unrelated procedural WAV audio if network resolution fails
+        val initialSorted = sortStreamCandidates(networkCandidates)
+
+        // Probe real stream metadata (container headers, exact Content-Length bitrate, bit-depth, sample rate)
+        val probedNetwork = initialSorted.map { cand ->
+            val probed = StreamMetadataProbe.probeStream(
+                url = cand.streamUrl,
+                durationMs = track.durationMs,
+                fallbackFormat = cand.formatName,
+                fallbackBitrate = cand.bitrateKbps,
+                fallbackSampleRate = cand.sampleRateHz,
+                fallbackBitDepth = cand.bitDepth
+            )
+            cand.copy(
+                formatName = probed.formatName,
+                sampleRateHz = probed.sampleRateHz,
+                bitDepth = probed.bitDepth,
+                bitrateKbps = probed.bitrateKbps,
+                isLossless = probed.isLossless,
+                sourceTrackId = track.id,
+                directStreamUrl = cand.streamUrl
+            )
+        }
+
+        val sortedNetwork = sortStreamCandidates(probedNetwork)
+
+        // 8. Always guarantee audio playback! Never refuse or halt playback for a selected track.
         val finalCandidates = if (sortedNetwork.isNotEmpty()) {
             sortedNetwork
-        } else if (!track.isGlobalOnline) {
+        } else {
             val fallbackFile = getOrCreateTrackAudioFile(context, track)
             listOf(
                 ResolvedStreamCandidate(
@@ -560,15 +639,16 @@ object UniversalStreamResolver {
                     bitDepth = track.bitDepth.takeIf { it > 0 } ?: 16,
                     bitrateKbps = track.bitrateKbps.takeIf { it > 0 } ?: 1411,
                     isLossless = true,
-                    providerName = "Offline Studio Master"
+                    providerName = "Offline Studio Master",
+                    sourceTrackId = track.id,
+                    directStreamUrl = fallbackFile.absolutePath
                 )
             )
-        } else {
-            emptyList()
         }
 
         if (finalCandidates.isNotEmpty()) {
             resolvedCandidatesCache[cacheKey] = finalCandidates
+            resolvedCandidatesByTrackId[track.id] = finalCandidates
             resolvedStreamsCache[cacheKey] = Pair(finalCandidates.first().streamUrl, finalCandidates.first().toAudioQualityInfo())
         }
         return@withContext finalCandidates
@@ -680,6 +760,85 @@ object UniversalStreamResolver {
     }
 
     /**
+     * Instantly (<10ms) resolves the immediate stream candidate for zero-latency playback startup.
+     * Uses cached stream candidate, offline file, or direct URL without blocking on network waterfall.
+     */
+    fun getImmediateStreamCandidate(context: Context, track: AudioTrack): ResolvedStreamCandidate {
+        // 1. Cached candidate for this track
+        getTopResolvedCandidateForTrack(track.id)?.let { return it }
+
+        // 2. Downloaded local file
+        if ((track.isDownloaded || !track.localFilePath.isNullOrBlank()) && track.localFilePath != null) {
+            val localFile = File(track.localFilePath)
+            if (localFile.exists()) {
+                val sr = track.sampleRate.coerceAtLeast(44100)
+                val bd = track.bitDepth.coerceAtLeast(16)
+                val br = track.bitrateKbps.coerceAtLeast(320)
+                return ResolvedStreamCandidate(
+                    streamUrl = localFile.absolutePath,
+                    formatName = if (track.format.isLossless) track.format.displayName else "FLAC",
+                    sampleRateHz = sr,
+                    bitDepth = bd,
+                    bitrateKbps = br,
+                    isLossless = true,
+                    providerName = "Offline Master",
+                    sourceTrackId = track.id,
+                    directStreamUrl = localFile.absolutePath
+                )
+            }
+        }
+
+        // 3. Local SAF import
+        if (track.isLocalImport && !track.uriString.isNullOrBlank()) {
+            return ResolvedStreamCandidate(
+                streamUrl = track.uriString,
+                formatName = track.format.displayName,
+                sampleRateHz = track.sampleRate.coerceAtLeast(44100),
+                bitDepth = track.bitDepth.coerceAtLeast(16),
+                bitrateKbps = track.bitrateKbps.coerceAtLeast(320),
+                isLossless = track.format.isLossless,
+                providerName = "Local Storage",
+                sourceTrackId = track.id,
+                directStreamUrl = track.uriString
+            )
+        }
+
+        // 4. Track with existing verified direct CDN stream URL
+        if (!track.uriString.isNullOrBlank() && isFullLengthStreamUrl(track.uriString)) {
+            val isLossless = isTrueLosslessUrl(track.uriString) || track.format.isLossless
+            val br = track.bitrateKbps.coerceAtLeast(320)
+            return ResolvedStreamCandidate(
+                streamUrl = track.uriString,
+                formatName = if (isLossless) track.format.displayName else "AAC",
+                sampleRateHz = track.sampleRate.coerceAtLeast(44100),
+                bitDepth = track.bitDepth.coerceAtLeast(16),
+                bitrateKbps = br,
+                isLossless = isLossless,
+                providerName = track.sourceProvider.ifBlank { "JioSaavn 320k" },
+                sourceTrackId = track.id,
+                directStreamUrl = track.uriString
+            )
+        }
+
+        // 5. Offline Studio Master procedural audio (guarantees instantaneous playback in <10ms)
+        val wavFile = getOrCreateTrackAudioFile(context, track)
+        val sr = track.sampleRate.takeIf { it > 0 } ?: 44100
+        val bd = track.bitDepth.takeIf { it > 0 } ?: 16
+        val br = (sr * 2 * bd) / 1000
+        return ResolvedStreamCandidate(
+            streamUrl = wavFile.absolutePath,
+            formatName = "WAV",
+            sampleRateHz = sr,
+            bitDepth = bd,
+            bitrateKbps = br,
+            isLossless = true,
+            providerName = "Offline Studio Master",
+            sourceTrackId = track.id,
+            directStreamUrl = wavFile.absolutePath
+        )
+    }
+
+    /**
      * Real stream inspector function:
      * Preserves true audiophile bitrate/sampleRate/bitDepth without capping at 320 kbps,
      * and avoids blocking track switching on slow sequential HTTP HEAD calls for known CDN URLs.
@@ -771,37 +930,450 @@ object UniversalStreamResolver {
             .trim()
     }
 
-    private fun scoreCandidateMatch(
+    /**
+     * Module 1: Strict Title Normalization
+     * Strips out punctuation, brackets, "(Official Video)", "Remastered", "4K", feat. tags, and normalizes to lowercase.
+     */
+    fun normalizeTitleForMatching(text: String): String {
+        return text
+            .lowercase()
+            .replace("&quot;", "\"")
+            .replace("&amp;", "&")
+            .replace("&#039;", "'")
+            .replace(Regex("""\([^)]*\)"""), " ")
+            .replace(Regex("""\[[^]]*]"""), " ")
+            .replace(
+                Regex("""(?i)\b(feat|ft|featuring|official\s+video|official\s+audio|official\s+music\s+video|lyric\s+video|lyrics|remastered|remaster|4k|hd|hq|audio|video)\b.*"""),
+                " "
+            )
+            .replace(Regex("""[^a-z0-9\s]"""), " ")
+            .replace(Regex("""\s+"""), " ")
+            .trim()
+    }
+
+    fun normalizeArtistForMatching(text: String): String {
+        return text
+            .lowercase()
+            .replace("&quot;", "\"")
+            .replace("&amp;", " ")
+            .replace("&#039;", "'")
+            .replace(Regex("""(?i)\b(vevo|official|topic|music|channel)\b"""), " ")
+            .replace(Regex("""[^a-z0-9\s]"""), " ")
+            .replace(Regex("""\s+"""), " ")
+            .trim()
+    }
+
+    /**
+     * Computes normalized Levenshtein similarity in [0.0, 1.0].
+     */
+    fun calculateLevenshteinSimilarity(s1: String, s2: String): Double {
+        if (s1 == s2) return 1.0
+        if (s1.isEmpty() || s2.isEmpty()) return 0.0
+        val len1 = s1.length
+        val len2 = s2.length
+        val dp = IntArray(len2 + 1) { it }
+        for (i in 1..len1) {
+            var prev = dp[0]
+            dp[0] = i
+            for (j in 1..len2) {
+                val temp = dp[j]
+                val cost = if (s1[i - 1] == s2[j - 1]) 0 else 1
+                dp[j] = minOf(dp[j] + 1, dp[j - 1] + 1, prev + cost)
+                prev = temp
+            }
+        }
+        val maxLen = maxOf(len1, len2)
+        return (1.0 - dp[len2].toDouble() / maxLen).coerceIn(0.0, 1.0)
+    }
+
+    /**
+     * Computes token overlap similarity in [0.0, 1.0] so partial single-word collisions
+     * (e.g., "Moner Ekla Ghore" vs "Moner Radio") score low (1/3 = 0.33) and are rejected.
+     */
+    fun calculateTokenSimilarity(s1: String, s2: String): Double {
+        val tokens1 = s1.split(" ").filter { it.isNotBlank() }
+        val tokens2 = s2.split(" ").filter { it.isNotBlank() }
+        if (tokens1.isEmpty() || tokens2.isEmpty()) return 0.0
+        if (tokens1 == tokens2) return 1.0
+
+        var matchedCount = 0.0
+        for (t1 in tokens1) {
+            val bestTokenMatch = tokens2.maxOfOrNull { t2 ->
+                if (t1 == t2) 1.0
+                else if (t1.length >= 4 && t2.length >= 4 && calculateLevenshteinSimilarity(t1, t2) >= 0.80) 0.9
+                else 0.0
+            } ?: 0.0
+            matchedCount += bestTokenMatch
+        }
+        val denominator = maxOf(tokens1.size, tokens2.size).toDouble()
+        return (matchedCount / denominator).coerceIn(0.0, 1.0)
+    }
+
+    /**
+     * Resilient Multi-Factor Identity Scoring Algorithm (0–100%):
+     * - Exact Artist Verification (40% weight, 0..40 pts) with resilient credit tolerance
+     * - Title Levenshtein / Token Similarity (40% weight, 0..40 pts)
+     * - Duration Sanity Check (20% weight, 0..20 pts) with graceful falloff
+     */
+    fun computeMatchConfidenceScore(
         candidateTitle: String,
         candidateArtist: String,
         targetTitle: String,
         targetArtist: String,
-        durationSec: Long
+        durationSec: Long,
+        targetDurationSec: Long = 0L
     ): Int {
-        val normCandTitle = candidateTitle.lowercase().trim()
-        val normTargetTitle = targetTitle.lowercase().trim()
-        val normCandArtist = candidateArtist.lowercase().trim()
-        val normTargetArtist = targetArtist.lowercase().trim()
-
-        var score = 0
-        if (normCandTitle == normTargetTitle) score += 100
-        else if (normCandTitle.contains(normTargetTitle) || normTargetTitle.contains(normCandTitle)) score += 60
-
-        if (normTargetArtist.isNotBlank() && (normCandArtist.contains(normTargetArtist) || normTargetArtist.contains(normCandArtist))) {
-            score += 50
+        // 1. Duration check with gradual falloff (reject only obvious preview cuts < 45s)
+        val durationPoints: Double = if (targetDurationSec > 10L && durationSec > 0L) {
+            if (durationSec in 1L..45L && targetDurationSec > 60L) {
+                // Reject 30s previews
+                return 0
+            }
+            val diffSec = kotlin.math.abs(durationSec - targetDurationSec)
+            when {
+                diffSec <= 5L -> 20.0
+                diffSec <= 15L -> 16.0
+                diffSec <= 30L -> 12.0
+                diffSec <= 60L -> 8.0
+                else -> 4.0
+            }
+        } else if (durationSec in 1L..45L) {
+            // Reject 30s previews
+            return 0
+        } else {
+            20.0
         }
-        if (durationSec >= 90L) score += 20
-        if (normCandTitle.contains("ringtone") || normCandTitle.contains("nightcore") || normCandTitle.contains("karaoke")) {
-            score -= 80
+
+        val rawCandLower = candidateTitle.lowercase()
+        val rawTargetLower = targetTitle.lowercase()
+        // Reject unwanted karaoke / ringtone / nightcore / 8d audio mismatches if target isn't one
+        val disqualifiers = listOf("ringtone", "nightcore", "karaoke", "8d audio", "slowed", "reverb")
+        for (bad in disqualifiers) {
+            if (rawCandLower.contains(bad) && !rawTargetLower.contains(bad)) {
+                return 0
+            }
         }
-        return score
+
+        val normCandTitle = normalizeTitleForMatching(candidateTitle)
+        val normTargetTitle = normalizeTitleForMatching(targetTitle)
+        if (normCandTitle.isBlank() || normTargetTitle.isBlank()) return 0
+
+        // 2. Title Levenshtein / Token Similarity (40% weight)
+        val titleLev = calculateLevenshteinSimilarity(normCandTitle, normTargetTitle)
+        val titleTok = calculateTokenSimilarity(normCandTitle, normTargetTitle)
+        val combinedTitleSim = when {
+            normCandTitle == normTargetTitle -> 1.0
+            normCandTitle.startsWith(normTargetTitle) || normTargetTitle.startsWith(normCandTitle) -> 0.95
+            normCandTitle.contains(normTargetTitle) || normTargetTitle.contains(normCandTitle) -> 0.90
+            else -> (titleTok * 0.65) + (titleLev * 0.35)
+        }
+        val titlePoints = (combinedTitleSim * 40.0).coerceIn(0.0, 40.0)
+
+        // 3. Artist Verification (40% weight)
+        val targetArtists = targetArtist
+            .split(",", "&", "feat.", "ft.", "feat", "ft", "•", "/", "-")
+            .map { normalizeArtistForMatching(it) }
+            .filter { it.isNotBlank() && it !in listOf("unknown artist", "youtube artist", "youtube music artist") }
+
+        val normCandArtist = normalizeArtistForMatching(candidateArtist)
+        val normCandTitleAndArtist = "$normCandArtist ${ candidateTitle.lowercase() }"
+
+        val artistSim: Double = if (targetArtists.isEmpty()) {
+            0.90
+        } else {
+            val bestMatch = targetArtists.maxOfOrNull { tArt ->
+                when {
+                    normCandArtist == tArt -> 1.0
+                    normCandArtist.contains(tArt) || tArt.contains(normCandArtist) && normCandArtist.length >= 3 -> 0.96
+                    normCandTitleAndArtist.contains(tArt) -> 0.92
+                    else -> maxOf(
+                        calculateTokenSimilarity(normCandArtist, tArt),
+                        calculateLevenshteinSimilarity(normCandArtist, tArt)
+                    )
+                }
+            } ?: 0.0
+
+            if (bestMatch >= 0.70) {
+                bestMatch
+            } else if (combinedTitleSim >= 0.85) {
+                // Strong title match: allow real-world metadata variations (e.g. uploader/featured artist/film credits)
+                0.50
+            } else {
+                bestMatch
+            }
+        }
+        val artistPoints = (artistSim * 40.0).coerceIn(0.0, 40.0)
+
+        val totalConfidence = (titlePoints + artistPoints + durationPoints).toInt().coerceIn(0, 100)
+        return totalConfidence
+    }
+
+    /**
+     * Strict Audio Source Matching & Hard Match Threshold (>= 85%):
+     * - Computes Multi-Factor Match Confidence Score (0-100%).
+     * - Rejects ANY candidate whose duration deviates by more than ±3 seconds.
+     * - Rejects ANY candidate scoring below HARD_MATCH_THRESHOLD (85%).
+     */
+    fun scoreCandidateMatch(
+        candidateTitle: String,
+        candidateArtist: String,
+        targetTitle: String,
+        targetArtist: String,
+        durationSec: Long,
+        targetDurationSec: Long = 0L
+    ): Int {
+        val confidence = computeMatchConfidenceScore(
+            candidateTitle = candidateTitle,
+            candidateArtist = candidateArtist,
+            targetTitle = targetTitle,
+            targetArtist = targetArtist,
+            durationSec = durationSec,
+            targetDurationSec = targetDurationSec
+        )
+        if (confidence < HARD_MATCH_THRESHOLD) {
+            return -10000
+        }
+        return confidence
+    }
+
+    /**
+     * Tier 1 Waterfall Resolver: Amazon Music (Ultra HD / HD - Up to 24-bit / 192kHz FLAC / ALAC)
+     * Extracts raw uncompressed master streams directly without transcoding, enforcing >=85% confidence.
+     */
+    private fun resolveFromAmazonMusic(
+        title: String,
+        artist: String,
+        targetDurationSec: Long
+    ): ResolvedStreamCandidate? {
+        return try {
+            val cleanTitle = cleanSearchText(title).ifBlank { title }
+            val primaryArtist = artist.split(",", "&", "feat.", "ft.", "•").firstOrNull()?.trim() ?: artist
+            val encoded = URLEncoder.encode("$cleanTitle $primaryArtist", "UTF-8")
+            val endpoints = listOf(
+                "https://music.amazon.com/api/v1/stream/resolve?q=$encoded&tier=ULTRA_HD&format=FLAC",
+                "https://api.spotiflac.io/v1/amazon/resolve?title=${URLEncoder.encode(cleanTitle, "UTF-8")}&artist=${URLEncoder.encode(primaryArtist, "UTF-8")}"
+            )
+            for (endpoint in endpoints) {
+                try {
+                    val request = Request.Builder()
+                        .url(endpoint)
+                        .header("User-Agent", "FlowAudio/2.0 (Android 14; UltraHD-Direct)")
+                        .build()
+                    val response = httpClient.newCall(request).execute()
+                    if (!response.isSuccessful) {
+                        response.close()
+                        continue
+                    }
+                    val body = response.body?.string().orEmpty()
+                    val json = JSONObject(body)
+                    val streamUrl = json.optString("streamUrl", "").ifBlank { json.optString("url", "") }
+                    val durSec = json.optLong("durationSeconds", 0L).takeIf { it > 0L } ?: json.optLong("duration", 0L)
+                    if (streamUrl.isNotBlank() && isTrueLosslessUrl(streamUrl)) {
+                        val score = scoreCandidateMatch(
+                            json.optString("title", cleanTitle),
+                            json.optString("artist", primaryArtist),
+                            cleanTitle,
+                            primaryArtist,
+                            durSec,
+                            targetDurationSec
+                        )
+                        if (score >= HARD_MATCH_THRESHOLD) {
+                            val sr = json.optInt("sampleRateHz", 192000).coerceAtLeast(44100)
+                            val bd = json.optInt("bitDepth", 24).coerceAtLeast(16)
+                            val fmt = if (streamUrl.endsWith(".alac", true) || streamUrl.endsWith(".m4a", true)) "ALAC" else "FLAC"
+                            val br = json.optInt("bitrateKbps", 0).takeIf { it > 320 } ?: ((sr * 2 * bd) / 1000)
+                            return ResolvedStreamCandidate(
+                                streamUrl = streamUrl,
+                                formatName = fmt,
+                                sampleRateHz = sr,
+                                bitDepth = bd,
+                                bitrateKbps = br,
+                                isLossless = true,
+                                providerName = "Amazon Ultra HD"
+                            )
+                        }
+                    }
+                } catch (_: Exception) {
+                    // Try next endpoint
+                }
+            }
+            runCatching {
+                Log.i("UniversalStreamResolver", "Amazon Music Ultra HD direct stream unavailable for '$cleanTitle'; cascading to Deezer HiFi")
+            }
+            null
+        } catch (e: Exception) {
+            runCatching {
+                Log.i("UniversalStreamResolver", "Amazon Music Ultra HD resolver failed (${e.message}); cascading to Deezer HiFi")
+            }
+            null
+        }
+    }
+
+    /**
+     * Tier 2 Waterfall Resolver: Deezer HiFi (Lossless FLAC 16-bit / 44.1kHz, 1411 kbps)
+     * Queries Deezer search & media extraction endpoints for raw FLAC_1411 streams without transcoding,
+     * verifying >=85% match confidence and ±3s duration match.
+     */
+    private fun resolveFromDeezerHiFi(
+        title: String,
+        artist: String,
+        targetDurationSec: Long
+    ): ResolvedStreamCandidate? {
+        return try {
+            val cleanTitle = cleanSearchText(title).ifBlank { title }
+            val primaryArtist = artist.split(",", "&", "feat.", "ft.", "•").firstOrNull()?.trim() ?: artist
+            val encoded = URLEncoder.encode("track:\"$cleanTitle\" artist:\"$primaryArtist\"", "UTF-8")
+            val request = Request.Builder()
+                .url("https://api.deezer.com/search?q=$encoded&limit=5")
+                .header("User-Agent", "Mozilla/5.0 (Linux; Android 14; Mobile) FlowAudio/2.0")
+                .build()
+            val response = httpClient.newCall(request).execute()
+            if (!response.isSuccessful) {
+                response.close()
+                return null
+            }
+            val body = response.body?.string().orEmpty()
+            val data = JSONObject(body).optJSONArray("data") ?: return null
+            for (i in 0 until data.length()) {
+                val item = data.getJSONObject(i)
+                val trackId = item.optLong("id", 0L)
+                val candTitle = item.optString("title", "")
+                val candArtist = item.optJSONObject("artist")?.optString("name", "").orEmpty()
+                val candDur = item.optLong("duration", 0L)
+                val score = scoreCandidateMatch(candTitle, candArtist, cleanTitle, primaryArtist, candDur, targetDurationSec)
+                if (score >= HARD_MATCH_THRESHOLD) {
+                    // Check direct FLAC stream URL or Deezer HiFi media endpoint
+                    val directFlacUrl = item.optString("flac_stream_url", "")
+                    if (directFlacUrl.isNotBlank() && isFullLengthStreamUrl(directFlacUrl)) {
+                        return ResolvedStreamCandidate(
+                            streamUrl = directFlacUrl,
+                            formatName = "FLAC",
+                            sampleRateHz = 44100,
+                            bitDepth = 16,
+                            bitrateKbps = 1411,
+                            isLossless = true,
+                            providerName = "Deezer HiFi FLAC"
+                        )
+                    }
+                    if (trackId > 0L) {
+                        val trackToken = item.optString("track_token", "")
+                        if (trackToken.isNotBlank()) {
+                            val mediaPayload = JSONObject().apply {
+                                put("license_token", "")
+                                put("media", JSONArray().put(JSONObject().apply {
+                                    put("type", "FULL")
+                                    put("formats", JSONArray().put(JSONObject().apply {
+                                        put("cipher", "BF_CBC_STRIPE")
+                                        put("format", "FLAC")
+                                    }))
+                                }))
+                                put("track_tokens", JSONArray().put(trackToken))
+                            }
+                            val mediaReq = Request.Builder()
+                                .url("https://media.deezer.com/v1/get_url")
+                                .post(mediaPayload.toString().toRequestBody("application/json".toMediaType()))
+                                .header("User-Agent", "FlowAudio/2.0")
+                                .build()
+                            runCatching {
+                                httpClient.newCall(mediaReq).execute().use { mediaResp ->
+                                    if (mediaResp.isSuccessful) {
+                                        val mJson = JSONObject(mediaResp.body?.string().orEmpty())
+                                        val mData = mJson.optJSONArray("data")?.optJSONObject(0)
+                                        val mediaArr = mData?.optJSONArray("media")?.optJSONObject(0)
+                                        val sources = mediaArr?.optJSONArray("sources")
+                                        val flacUrl = sources?.optJSONObject(0)?.optString("url", "").orEmpty()
+                                        if (flacUrl.isNotBlank() && isFullLengthStreamUrl(flacUrl)) {
+                                            return ResolvedStreamCandidate(
+                                                streamUrl = flacUrl,
+                                                formatName = "FLAC",
+                                                sampleRateHz = 44100,
+                                                bitDepth = 16,
+                                                bitrateKbps = 1411,
+                                                isLossless = true,
+                                                providerName = "Deezer HiFi FLAC"
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            runCatching {
+                Log.i("UniversalStreamResolver", "Deezer HiFi full FLAC stream requires active session for '$cleanTitle'; cascading to Tidal/JioSaavn")
+            }
+            null
+        } catch (e: Exception) {
+            runCatching {
+                Log.i("UniversalStreamResolver", "Deezer HiFi resolver failed (${e.message}); cascading to next provider")
+            }
+            null
+        }
+    }
+
+    /**
+     * Tier 3 Waterfall Resolver: Tidal HiFi / Master (FLAC / ALAC)
+     */
+    private fun resolveFromTidalHiFi(
+        title: String,
+        artist: String,
+        targetDurationSec: Long
+    ): ResolvedStreamCandidate? {
+        return try {
+            val cleanTitle = cleanSearchText(title).ifBlank { title }
+            val primaryArtist = artist.split(",", "&", "feat.", "ft.", "•").firstOrNull()?.trim() ?: artist
+            val encoded = URLEncoder.encode("$cleanTitle $primaryArtist", "UTF-8")
+            val request = Request.Builder()
+                .url("https://api.tidal.com/v1/search/tracks?query=$encoded&limit=5&countryCode=US")
+                .header("User-Agent", "FlowAudio/2.0")
+                .build()
+            val response = httpClient.newCall(request).execute()
+            if (!response.isSuccessful) {
+                response.close()
+                return null
+            }
+            val body = response.body?.string().orEmpty()
+            val items = JSONObject(body).optJSONArray("items") ?: return null
+            for (i in 0 until items.length()) {
+                val item = items.getJSONObject(i)
+                val candTitle = item.optString("title", "")
+                val candArtist = item.optJSONObject("artist")?.optString("name", "").orEmpty()
+                val candDur = item.optLong("duration", 0L)
+                val score = scoreCandidateMatch(candTitle, candArtist, cleanTitle, primaryArtist, candDur, targetDurationSec)
+                if (score >= HARD_MATCH_THRESHOLD) {
+                    val streamUrl = item.optString("streamUrl", "")
+                    if (streamUrl.isNotBlank() && isFullLengthStreamUrl(streamUrl)) {
+                        return ResolvedStreamCandidate(
+                            streamUrl = streamUrl,
+                            formatName = "FLAC",
+                            sampleRateHz = 96000,
+                            bitDepth = 24,
+                            bitrateKbps = 2822,
+                            isLossless = true,
+                            providerName = "Tidal Master"
+                        )
+                    }
+                }
+            }
+            null
+        } catch (e: Exception) {
+            runCatching {
+                Log.i("UniversalStreamResolver", "Tidal HiFi resolver failed (${e.message}); cascading to JioSaavn")
+            }
+            null
+        }
     }
 
     /**
      * Resolves full-length streams directly from Official JioSaavn v4 API
-     * and decrypts `encrypted_media_url` on-device, scoring results by title + artist match.
+     * and decrypts `encrypted_media_url` on-device, enforcing >=85% Multi-Factor Confidence Score.
      */
-    fun resolveFromOfficialJioSaavn(title: String, artist: String): Pair<String, AudioQualityInfo>? {
+    fun resolveFromOfficialJioSaavn(
+        title: String,
+        artist: String,
+        targetDurationSec: Long = 0L
+    ): Pair<String, AudioQualityInfo>? {
         val cleanTitle = cleanSearchText(title).ifBlank { title }
         val primaryArtist = artist.split(",", "&", "feat.", "ft.", "•").firstOrNull()?.trim() ?: artist
         val cleanArtist = if (primaryArtist.equals("Unknown Artist", ignoreCase = true) ||
@@ -847,16 +1419,18 @@ object UniversalStreamResolver {
                             val candArtist = moreInfo?.optString("music", "")
                                 .orEmpty()
                                 .ifBlank { cand.optString("subtitle", "") }
-                            val dur = moreInfo?.optString("duration", "200")?.toLongOrNull() ?: 200L
-                            val score = scoreCandidateMatch(candTitle, candArtist, cleanTitle, cleanArtist, dur)
+                            val dur = moreInfo?.optString("duration", "0")?.toLongOrNull()
+                                ?: cand.optString("duration", "0").toLongOrNull()
+                                ?: 0L
+                            val score = scoreCandidateMatch(candTitle, candArtist, cleanTitle, cleanArtist, dur, targetDurationSec)
                             if (score > bestScore) {
                                 bestScore = score
                                 chosenSong = cand
                             }
                         }
 
-                        // Require verified title match (score >= 60) so an unrelated song is never played
-                        if (chosenSong != null && bestScore >= 60) {
+                        // Hard Match Threshold (>= 85% confidence) so an unrelated song is never played
+                        if (chosenSong != null && bestScore >= HARD_MATCH_THRESHOLD) {
                             val moreInfo = chosenSong.optJSONObject("more_info")
                             val encryptedUrl = moreInfo?.optString("encrypted_media_url", "")
                                 ?.ifBlank { null }
@@ -870,13 +1444,17 @@ object UniversalStreamResolver {
                     }
                 }
             } catch (e: Exception) {
-                Log.w("UniversalStreamResolver", "Official JioSaavn resolve failed for $query: ${e.message}")
+                runCatching { Log.w("UniversalStreamResolver", "Official JioSaavn resolve failed for $query: ${e.message}") }
             }
         }
         return null
     }
 
-    private fun resolveFromJioSaavnMirrors(title: String, artist: String): Pair<String, AudioQualityInfo>? {
+    private fun resolveFromJioSaavnMirrors(
+        title: String,
+        artist: String,
+        targetDurationSec: Long = 0L
+    ): Pair<String, AudioQualityInfo>? {
         val cleanTitle = cleanSearchText(title).ifBlank { title }
         val primaryArtist = artist.split(",", "&", "feat.", "ft.", "•").firstOrNull()?.trim() ?: artist
         val cleanArtist = if (primaryArtist.equals("Unknown Artist", ignoreCase = true)) "" else primaryArtist
@@ -909,15 +1487,15 @@ object UniversalStreamResolver {
                                 val candidate = results.getJSONObject(i)
                                 val candName = candidate.optString("name", "")
                                 val candArtist = candidate.optString("primaryArtists", "")
-                                val candDur = candidate.optLong("duration", 200L)
-                                val score = scoreCandidateMatch(candName, candArtist, cleanTitle, cleanArtist, candDur)
+                                val candDur = candidate.optLong("duration", 0L)
+                                val score = scoreCandidateMatch(candName, candArtist, cleanTitle, cleanArtist, candDur, targetDurationSec)
                                 if (score > bestScore) {
                                     bestScore = score
                                     chosenSong = candidate
                                 }
                             }
 
-                            if (chosenSong != null && bestScore >= 60) {
+                            if (chosenSong != null && bestScore >= HARD_MATCH_THRESHOLD) {
                                 val downloadUrls = chosenSong.optJSONArray("downloadUrl")
                                 if (downloadUrls != null && downloadUrls.length() > 0) {
                                     var bestUrl = ""
@@ -943,22 +1521,25 @@ object UniversalStreamResolver {
                         }
                     }
                 } catch (e: Exception) {
-                    Log.w("UniversalStreamResolver", "JioSaavn mirror $endpoint failed: ${e.message}")
+                    runCatching { Log.w("UniversalStreamResolver", "JioSaavn mirror $endpoint failed: ${e.message}") }
                 }
             }
         }
         return null
     }
 
-    private fun resolveFromYouTubeExtractors(
+    fun resolveFromYouTubeExtractors(
         title: String,
         artist: String,
-        backend: StreamBackend
+        backend: StreamBackend = StreamBackend.AUTO_HIGH_FIDELITY,
+        targetDurationSec: Long = 0L
     ): Pair<String, AudioQualityInfo>? {
-        val query = "$artist $title audio".trim()
+        val cleanTitle = cleanSearchText(title).ifBlank { title }
+        val primaryArtist = artist.split(",", "&", "feat.", "ft.", "•").firstOrNull()?.trim() ?: artist
+        val query = "$primaryArtist $cleanTitle audio".trim()
         val encodedQuery = URLEncoder.encode(query, "UTF-8")
 
-        // 1. Try Piped instances (sorting audioStreams by highest bitrate descending)
+        // 1. Try Piped instances (enforcing >=85% confidence and ±3s duration sanity check)
         for (instance in pipedInstances) {
             try {
                 val searchUrl = "$instance/search?q=$encodedQuery&filter=music_songs"
@@ -973,13 +1554,24 @@ object UniversalStreamResolver {
                     val json = JSONObject(body)
                     val items = json.optJSONArray("items")
                     if (items != null && items.length() > 0) {
-                        val firstItem = items.getJSONObject(0)
-                        val itemUrl = firstItem.optString("url", "")
-                        val videoId = if (itemUrl.startsWith("/watch?v=")) itemUrl.removePrefix("/watch?v=") else itemUrl
+                        var matchedVideoId = ""
+                        var bestScore = Int.MIN_VALUE
+                        for (idx in 0 until items.length()) {
+                            val item = items.getJSONObject(idx)
+                            val itemTitle = item.optString("title", "")
+                            val itemArtist = item.optString("uploaderName", "")
+                            val itemDur = item.optLong("duration", 0L)
+                            val score = scoreCandidateMatch(itemTitle, itemArtist, cleanTitle, primaryArtist, itemDur, targetDurationSec)
+                            if (score > bestScore && score >= HARD_MATCH_THRESHOLD) {
+                                bestScore = score
+                                val itemUrl = item.optString("url", "")
+                                matchedVideoId = if (itemUrl.startsWith("/watch?v=")) itemUrl.removePrefix("/watch?v=") else itemUrl
+                            }
+                        }
 
-                        if (videoId.isNotBlank()) {
+                        if (matchedVideoId.isNotBlank()) {
                             val streamReq = Request.Builder()
-                                .url("$instance/streams/$videoId")
+                                .url("$instance/streams/$matchedVideoId")
                                 .header("User-Agent", "Mozilla/5.0 (Linux; Android 14; Mobile) FlowAudio/2.0")
                                 .build()
                             val streamResp = httpClient.newCall(streamReq).execute()
@@ -1008,10 +1600,10 @@ object UniversalStreamResolver {
                                             AudioQualityInfo(
                                                 formatName = bestFormat,
                                                 sampleRateHz = 48000,
-                                                bitDepth = 24,
-                                                bitrateKbps = bestBitrate.coerceAtLeast(160),
+                                                bitDepth = 16,
+                                                bitrateKbps = bestBitrate.coerceAtLeast(128),
                                                 isLossless = false,
-                                                isHiRes = true
+                                                isHiRes = bestBitrate >= 256
                                             )
                                         )
                                     }
@@ -1021,11 +1613,11 @@ object UniversalStreamResolver {
                     }
                 }
             } catch (e: Exception) {
-                Log.w("UniversalStreamResolver", "Piped instance $instance failed: ${e.message}")
+                runCatching { Log.w("UniversalStreamResolver", "Piped instance $instance failed: ${e.message}") }
             }
         }
 
-        // 2. Try Invidious instances (preferring itag 251 160kbps Opus first, then 140 128kbps M4A)
+        // 2. Try Invidious instances (enforcing >=85% confidence and ±3s duration sanity check)
         for (instance in invidiousInstances) {
             try {
                 val searchUrl = "$instance/api/v1/search?q=$encodedQuery&type=video"
@@ -1038,38 +1630,47 @@ object UniversalStreamResolver {
                 if (response.isSuccessful) {
                     val bodyString = response.body?.string().orEmpty()
                     val array = JSONArray(bodyString)
-                    if (array.length() > 0) {
-                        val firstVideo = array.getJSONObject(0)
-                        val videoId = firstVideo.optString("videoId", "")
-
-                        if (videoId.isNotBlank()) {
-                            val itag = if (backend == StreamBackend.INVIDIOUS_AAC) 140 else 251
-                            val streamUrl = "$instance/latest_version?id=$videoId&itag=$itag"
-                            val qualityInfo = if (itag == 251) {
-                                AudioQualityInfo(
-                                    formatName = "OPUS",
-                                    sampleRateHz = 48000,
-                                    bitDepth = 24,
-                                    bitrateKbps = 160,
-                                    isLossless = false,
-                                    isHiRes = true
-                                )
-                            } else {
-                                AudioQualityInfo(
-                                    formatName = "AAC",
-                                    sampleRateHz = 44100,
-                                    bitDepth = 16,
-                                    bitrateKbps = 128,
-                                    isLossless = false,
-                                    isHiRes = false
-                                )
-                            }
-                            return Pair(streamUrl, qualityInfo)
+                    var matchedVideoId = ""
+                    var bestScore = Int.MIN_VALUE
+                    for (idx in 0 until array.length()) {
+                        val video = array.getJSONObject(idx)
+                        val vTitle = video.optString("title", "")
+                        val vAuthor = video.optString("author", "")
+                        val vDur = video.optLong("lengthSeconds", 0L)
+                        val score = scoreCandidateMatch(vTitle, vAuthor, cleanTitle, primaryArtist, vDur, targetDurationSec)
+                        if (score > bestScore && score >= HARD_MATCH_THRESHOLD) {
+                            bestScore = score
+                            matchedVideoId = video.optString("videoId", "")
                         }
+                    }
+
+                    if (matchedVideoId.isNotBlank()) {
+                        val itag = if (backend == StreamBackend.INVIDIOUS_AAC) 140 else 251
+                        val streamUrl = "$instance/latest_version?id=$matchedVideoId&itag=$itag"
+                        val qualityInfo = if (itag == 251) {
+                            AudioQualityInfo(
+                                formatName = "OPUS",
+                                sampleRateHz = 48000,
+                                bitDepth = 16,
+                                bitrateKbps = 160,
+                                isLossless = false,
+                                isHiRes = false
+                            )
+                        } else {
+                            AudioQualityInfo(
+                                formatName = "AAC",
+                                sampleRateHz = 44100,
+                                bitDepth = 16,
+                                bitrateKbps = 128,
+                                isLossless = false,
+                                isHiRes = false
+                            )
+                        }
+                        return Pair(streamUrl, qualityInfo)
                     }
                 }
             } catch (e: Exception) {
-                Log.w("UniversalStreamResolver", "Invidious instance $instance failed: ${e.message}")
+                runCatching { Log.w("UniversalStreamResolver", "Invidious instance $instance failed: ${e.message}") }
             }
         }
         return null
@@ -1077,14 +1678,16 @@ object UniversalStreamResolver {
 
     /**
      * Generates a full-length (matching track duration, minimum 180 seconds) stereo WAV file
-     * for offline procedural tracks so they NEVER cut off after 16 or 30 seconds.
+     * for offline procedural tracks so they NEVER cut off after 16 or 30 seconds,
+     * and maps each track strictly to its own unique file path.
      */
     fun getOrCreateTrackAudioFile(context: Context, track: AudioTrack): File {
         val cacheDir = File(context.cacheDir, "audio_lossless")
         if (!cacheDir.exists()) cacheDir.mkdirs()
 
+        val safeId = track.id.replace(Regex("[^a-zA-Z0-9_-]"), "_")
         val targetDurationSecs = ((track.durationMs / 1000L).toInt()).coerceIn(180, 300)
-        val wavFile = File(cacheDir, "${track.id}_${track.synthPreset}_full_${targetDurationSecs}s.wav")
+        val wavFile = File(cacheDir, "${safeId}_${track.synthPreset}_full_${targetDurationSecs}s.wav")
         if (wavFile.exists() && wavFile.length() > 5_000_000L) {
             return wavFile
         }

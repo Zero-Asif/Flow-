@@ -18,15 +18,25 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Grant execute permission for gradlew
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Setup Environment and Keystore
         run: |
-          if [ -f "gradlew" ]; then
-            chmod +x gradlew
+          # Copy .env file if available
+          if [ -f ".env.example" ] && [ ! -f ".env" ]; then
+            cp .env.example .env
+          fi
+
+          # Generate dummy debug.keystore if missing
+          if [ ! -f "debug.keystore" ]; then
+            keytool -genkey -v -keystore debug.keystore -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 -storepass android -keypass android -dname "CN=Android Debug,O=Android,C=US"
           fi
 
       - name: Build APK with Gradle
         run: |
-          if [ -f "gradlew" ]; then
+          if [ -f "./gradlew" ]; then
+            chmod +x gradlew
             ./gradlew assembleDebug --stacktrace
           else
             gradle assembleDebug --stacktrace
@@ -34,6 +44,7 @@ jobs:
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: release-or-debug-apk
+          name: debug-apk
           path: app/build/outputs/apk/**/*.apk

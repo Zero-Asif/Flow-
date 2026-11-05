@@ -1,9 +1,11 @@
 package com.example
 
-import com.example.audio.PcmAudioSynthesizer
+import com.example.audio.AudioMetadataProber
 import com.example.data.SampleTracks
+import com.example.model.AudioQualityInfo
 import com.example.model.EqualizerPreset
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -39,20 +41,31 @@ class FlowLosslessUnitTest {
     }
 
     @Test
-    fun testProceduralAudioSynthesizer() {
-        val chunk = PcmAudioSynthesizer.generateChunk(
-            preset = "synthwave_pulse",
-            secondInTrack = 0,
-            sampleCount = 1000,
-            bassMultiplier = 1.0f,
-            trebleMultiplier = 1.0f,
-            virtualizerWidth = 0.2f
+    fun testUncompressedBitrateMathematicalParity() {
+        // Uncompressed 16-bit 44.1kHz stereo PCM WAV is strictly 44100 * 2 * 16 / 1000 = 1411.2 -> 1411 kbps
+        val pcm16Bitrate = (44100L * 2 * 16) / 1000
+        assertEquals(1411L, pcm16Bitrate)
+
+        // 24-bit 96kHz stereo PCM is strictly 96000 * 2 * 24 / 1000 = 4608 kbps
+        val pcm24_96Bitrate = (96000L * 2 * 24) / 1000
+        assertEquals(4608L, pcm24_96Bitrate)
+
+        // 24-bit 192kHz stereo PCM is strictly 192000 * 2 * 24 / 1000 = 9216 kbps
+        val pcm24_192Bitrate = (192000L * 2 * 24) / 1000
+        assertEquals(9216L, pcm24_192Bitrate)
+
+        val quality = AudioQualityInfo(
+            formatName = "FLAC",
+            sampleRateHz = 44100,
+            bitDepth = 16,
+            bitrateKbps = 1411,
+            channelCount = 2,
+            isLossless = true,
+            isHiRes = false
         )
-        // Stereo has 2 channels
-        assertEquals(2000, chunk.size)
-        // Ensure not all zeros (audio is generated)
-        val hasSound = chunk.any { it != 0.toShort() }
-        assertTrue("Synthesized audio buffer should contain valid waveform data", hasSound)
+        assertTrue(quality.isLossless)
+        assertFalse(quality.isHiRes)
+        assertEquals(1411, quality.bitrateKbps)
     }
 
     @Test

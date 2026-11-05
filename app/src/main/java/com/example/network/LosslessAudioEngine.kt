@@ -86,24 +86,19 @@ object LosslessAudioEngine {
             return@withContext UniversalStreamResolver.sortStreamCandidates(candidates)
         }
 
-        // Offline Fallback: Guarantee audio playback without throwing an error popup
-        val fallbackFile = UniversalStreamResolver.getOrCreateTrackAudioFile(context, track)
-        val sr = track.sampleRate.takeIf { it > 0 } ?: 44100
-        val bd = track.bitDepth.takeIf { it > 0 } ?: 16
-        val br = (sr * 2 * bd) / 1000
-        listOf(
-            ResolvedStreamCandidate(
-                streamUrl = fallbackFile.absolutePath,
-                formatName = "WAV",
-                sampleRateHz = sr,
-                bitDepth = bd,
-                bitrateKbps = br,
-                isLossless = true,
-                providerName = "Offline Studio Master",
-                sourceTrackId = track.id,
-                directStreamUrl = fallbackFile.absolutePath
-            )
-        )
+        // Under NO circumstance should synthetic PCM audio or silent mock frames be generated when a network stream fails.
+        // Fallback directly to genuine network streams: JioSaavn 320k -> YouTube Music
+        val saavnFallback = resolveJioSaavn320k(effectiveCanonical)
+        if (saavnFallback != null) {
+            return@withContext listOf(saavnFallback)
+        }
+
+        val ytFallback = resolveYouTubeFallback(effectiveCanonical)
+        if (ytFallback != null) {
+            return@withContext listOf(ytFallback)
+        }
+
+        emptyList()
     }
 
     /**
@@ -428,12 +423,12 @@ object LosslessAudioEngine {
         if (ytResult != null) {
             return ResolvedStreamCandidate(
                 streamUrl = ytResult.first,
-                formatName = ytResult.second.formatName,
+                formatName = if (ytResult.first.contains("opus", true) || ytResult.second.formatName.contains("opus", true)) "OPUS" else ytResult.second.formatName,
                 sampleRateHz = ytResult.second.sampleRateHz,
                 bitDepth = ytResult.second.bitDepth,
                 bitrateKbps = ytResult.second.bitrateKbps,
                 isLossless = false,
-                providerName = "YouTube Music (Fallback)",
+                providerName = "YouTube Music (HQ Opus)",
                 directStreamUrl = ytResult.first
             )
         }

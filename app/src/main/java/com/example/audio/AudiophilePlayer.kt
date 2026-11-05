@@ -2,12 +2,8 @@ package com.example.audio
 
 import android.content.Context
 import android.media.AudioAttributes
-import android.media.AudioFormat
-import android.media.AudioManager
-import android.media.AudioTrack
 import android.media.MediaPlayer
 import android.net.Uri
-import android.os.Build
 import android.util.Log
 import com.example.model.AudioTrack as MusicTrack
 import com.example.model.EqualizerPreset
@@ -19,10 +15,14 @@ import kotlinx.coroutines.launch
 import kotlin.math.abs
 import kotlin.math.sin
 
+/**
+ * AudiophilePlayer:
+ * Lightweight media player for genuine local audio files and verified URIs.
+ * Under no circumstance does this class generate synthetic PCM or mock frames.
+ */
 class AudiophilePlayer(private val context: Context) {
     private val scope = CoroutineScope(Dispatchers.Default)
 
-    private var audioTrackInstance: AudioTrack? = null
     private var mediaPlayerInstance: MediaPlayer? = null
     private var playbackJob: Job? = null
 
@@ -44,12 +44,13 @@ class AudiophilePlayer(private val context: Context) {
         currentMusicTrack = track
         playbackPositionMs = startPositionMs
         trackDurationMs = track.durationMs
-        isPlayingState = true
 
-        if (track.uriString != null) {
+        if (!track.uriString.isNullOrBlank()) {
+            isPlayingState = true
             playLocalUri(track.uriString, startPositionMs)
         } else {
-            playSynthesizedStream(track, startPositionMs)
+            Log.w("AudiophilePlayer", "No stream URI available for track: ${track.title}")
+            isPlayingState = false
         }
     }
 
@@ -76,93 +77,13 @@ class AudiophilePlayer(private val context: Context) {
             }
             startPositionPoller()
         } catch (e: Exception) {
-            Log.e("AudiophilePlayer", "Failed to play local URI, falling back to synth", e)
-            playSynthesizedStream(currentMusicTrack!!, startPositionMs)
-        }
-    }
-
-    private fun playSynthesizedStream(track: MusicTrack, startPositionMs: Long) {
-        val sampleRate = PcmAudioSynthesizer.SAMPLE_RATE
-        val channelConfig = AudioFormat.CHANNEL_OUT_STEREO
-        val audioFormat = AudioFormat.ENCODING_PCM_16BIT
-        val bufferSize = AudioTrack.getMinBufferSize(sampleRate, channelConfig, audioFormat) * 2
-
-        val attributes = AudioAttributes.Builder()
-            .setUsage(AudioAttributes.USAGE_MEDIA)
-            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-            .build()
-
-        val format = AudioFormat.Builder()
-            .setEncoding(audioFormat)
-            .setSampleRate(sampleRate)
-            .setChannelMask(channelConfig)
-            .build()
-
-        audioTrackInstance = AudioTrack.Builder()
-            .setAudioAttributes(attributes)
-            .setAudioFormat(format)
-            .setBufferSizeInBytes(bufferSize)
-            .setTransferMode(AudioTrack.MODE_STREAM)
-            .build()
-
-        audioTrackInstance?.play()
-
-        playbackJob = scope.launch {
-            var currentSec = (startPositionMs / 1000).toInt()
-            val chunkDurationMs = 250L
-
-            while (isActive && isPlayingState) {
-                // Apply Equalizer adjustments to sound synthesis
-                val bassBoostVal = activePreset.bassBoost
-                val bassMultiplier = (1.0f + bassBoostVal * 1.5f + (activePreset.bandGains.getOrNull(0) ?: 0f) / 10f).coerceIn(0.2f, 3.0f)
-                val trebleMultiplier = (1.0f + (activePreset.bandGains.getOrNull(8) ?: 0f) / 12f).coerceIn(0.2f, 2.5f)
-                val virtualizerVal = activePreset.virtualizer
-
-                val chunk = PcmAudioSynthesizer.generateChunk(
-                    preset = track.synthPreset,
-                    secondInTrack = currentSec,
-                    sampleCount = sampleRate / 4,
-                    bassMultiplier = bassMultiplier,
-                    trebleMultiplier = trebleMultiplier,
-                    virtualizerWidth = virtualizerVal
-                )
-
-                // Master volume scaling
-                if (masterVolume < 0.99f) {
-                    for (i in chunk.indices) {
-                        chunk[i] = (chunk[i] * masterVolume).toInt().toShort()
-                    }
-                }
-
-                audioTrackInstance?.write(chunk, 0, chunk.size)
-
-                // Advance track position
-                playbackPositionMs += chunkDurationMs
-                if (playbackPositionMs >= trackDurationMs) {
-                    playbackPositionMs = trackDurationMs
-                    onPositionChanged?.invoke(playbackPositionMs, trackDurationMs)
-                    isPlayingState = false
-                    launch(Dispatchers.Main) {
-                        onTrackFinished?.invoke()
-                    }
-                    break
-                }
-
-                currentSec = (playbackPositionMs / 1000).toInt()
-                onPositionChanged?.invoke(playbackPositionMs, trackDurationMs)
-
-                // Generate simulated 24-band FFT visualizer response
-                val amplitudes = List(24) { bandIdx ->
-                    val freqFactor = sin(bandIdx * 0.4 + playbackPositionMs * 0.008).toFloat()
-                    val pulse = (abs(freqFactor) * 0.7f + 0.15f * (bassBoostVal + 0.3f)).coerceIn(0.1f, 1.0f)
-                    pulse * masterVolume
-                }
-                onVisualizerUpdate?.invoke(amplitudes)
-            }
+            Log.e("AudiophilePlayer", "Failed to play stream URI: $uriString", e)
+            isPlayingState = false
         }
     }
 
     private fun startPositionPoller() {
+        playbackJob?.cancel()
         playbackJob = scope.launch {
             while (isActive && isPlayingState) {
                 mediaPlayerInstance?.let { mp ->
@@ -186,19 +107,16 @@ class AudiophilePlayer(private val context: Context) {
 
     fun pause() {
         isPlayingState = false
-        audioTrackInstance?.pause()
         mediaPlayerInstance?.pause()
         playbackJob?.cancel()
     }
 
     fun resume() {
         if (currentMusicTrack != null && !isPlayingState) {
-            isPlayingState = true
-            if (mediaPlayerInstance != null) {
-                mediaPlayerInstance?.start()
+            mediaPlayerInstance?.let { mp ->
+                isPlayingState = true
+                mp.start()
                 startPositionPoller()
-            } else {
-                playSynthesizedStream(currentMusicTrack!!, playbackPositionMs)
             }
         }
     }
@@ -206,22 +124,12 @@ class AudiophilePlayer(private val context: Context) {
     fun seekTo(positionMs: Long) {
         playbackPositionMs = positionMs
         mediaPlayerInstance?.seekTo(positionMs.toInt())
-        if (audioTrackInstance != null && isPlayingState) {
-            audioTrackInstance?.pause()
-            audioTrackInstance?.flush()
-            playbackJob?.cancel()
-            playSynthesizedStream(currentMusicTrack!!, positionMs)
-        }
     }
 
     fun stop() {
         isPlayingState = false
         playbackJob?.cancel()
         playbackJob = null
-
-        audioTrackInstance?.stop()
-        audioTrackInstance?.release()
-        audioTrackInstance = null
 
         mediaPlayerInstance?.stop()
         mediaPlayerInstance?.release()

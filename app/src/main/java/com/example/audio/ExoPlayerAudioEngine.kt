@@ -321,45 +321,11 @@ class ExoPlayerAudioEngine(private val context: Context) {
             return
         }
 
-        // Exhausted online candidates: guarantee uninterrupted playback via local master WAV without throwing an error dialog
-        scope.launch {
-            try {
-                val cachedWavUri = withContext(Dispatchers.IO) {
-                    getCachedWavUriForTrack(track)
-                }
-                val wavQuality = AudioQualityInfo(
-                    formatName = "PCM WAV",
-                    sampleRateHz = 44100,
-                    bitDepth = 16,
-                    bitrateKbps = (44100 * 2 * 16) / 1000,
-                    channelCount = 2,
-                    isLossless = true,
-                    isHiRes = false
-                )
-                activeResolvedQuality = wavQuality
-                val updatedTrack = track.copy(
-                    uriString = cachedWavUri.toString(),
-                    format = AudioFormat.WAV,
-                    bitrateKbps = (44100 * 2 * 16) / 1000,
-                    sampleRate = 44100,
-                    bitDepth = 16
-                )
-                pendingTrack = updatedTrack
-                pendingQuality = wavQuality
-
-                val fallbackItem = createMediaItemForTrack(updatedTrack, isActiveTrack = true)
-                exoPlayer.stop()
-                exoPlayer.clearMediaItems()
-                exoPlayer.setMediaItem(fallbackItem, 0L)
-                exoPlayer.prepare()
-                exoPlayer.playWhenReady = true
-                exoPlayer.play()
-            } catch (e: Exception) {
-                isSwitchingTrack = false
-                _isLoadingTrack.value = false
-                Log.e("ExoPlayerAudioEngine", "Failed offline WAV recovery", e)
-            }
-        }
+        // Online candidates exhausted: notify error without falling back to fake/synthetic audio
+        isSwitchingTrack = false
+        _isLoadingTrack.value = false
+        _playbackError.value = "Playback unavailable for '${track.title}'. Stream could not be reached."
+        Log.e("ExoPlayerAudioEngine", "All stream candidates exhausted for track: ${track.title} ($reason)")
     }
 
     private fun setupPlayerListeners() {
@@ -500,53 +466,57 @@ class ExoPlayerAudioEngine(private val context: Context) {
         val effectiveQueue = if (queue.isNotEmpty()) queue else listOf(track)
 
         // Step 2: Instant Audio Pipeline (<100ms startup)
-        // Immediately initiate primary candidate stream URL and call player.play() without network awaiting
+        // Immediately check for direct/cached/local stream candidate
         val immediateCandidate = UniversalStreamResolver.getImmediateStreamCandidate(context, track)
-        activeStreamCandidates = listOf(immediateCandidate)
-        _availableStreamCandidates.value = listOf(immediateCandidate)
-        _activeStreamCandidate.value = immediateCandidate
-        currentCandidateIndex = 0
 
-        val immediateQuality = immediateCandidate.toAudioQualityInfo()
-        activeResolvedQuality = immediateQuality
-
-        val immediateTrack = track.copy(
-            uriString = immediateCandidate.directStreamUrl,
-            format = mapFormatStringToEnum(immediateCandidate.formatName, track.format),
-            bitrateKbps = immediateCandidate.bitrateKbps,
-            sampleRate = immediateCandidate.sampleRateHz,
-            bitDepth = immediateCandidate.bitDepth,
-            sourceProvider = immediateCandidate.providerName
-        )
-
-        val updatedQueue = if (effectiveQueue.any { it.id == immediateTrack.id }) {
-            effectiveQueue.map { if (it.id == immediateTrack.id) immediateTrack else it }
-        } else {
-            listOf(immediateTrack) + effectiveQueue
-        }
-
-        currentPlaylist = updatedQueue
-        pendingTrack = immediateTrack
-        pendingQuality = immediateQuality
-
-        val initialMediaItem = createMediaItemForTrack(immediateTrack, isActiveTrack = true)
-
+        // Synchronously execute hard stop, media item clearance, and decoder buffer reset
         exoPlayer.stop()
         exoPlayer.clearMediaItems()
-        exoPlayer.pauseAtEndOfMediaItems = !isGaplessEnabled
-        exoPlayer.setMediaItem(initialMediaItem, /* startPositionMs = */ 0L)
-        exoPlayer.prepare()
-        exoPlayer.playWhenReady = true
-        exoPlayer.play()
+        fftAudioProcessor.setPlaying(false)
 
-        currentTrack = immediateTrack
-        _currentTrackState.value = immediateTrack
-        _audioQualityState.value = immediateQuality
-        _isPlayingState.value = true
-        fftAudioProcessor.setPlaying(true)
-        onPlaybackStateChanged?.invoke(true)
-        startPositionPoller()
-        commitPendingTrackIfReady()
+        if (immediateCandidate != null) {
+            activeStreamCandidates = listOf(immediateCandidate)
+            _availableStreamCandidates.value = listOf(immediateCandidate)
+            _activeStreamCandidate.value = immediateCandidate
+            currentCandidateIndex = 0
+
+            val immediateQuality = immediateCandidate.toAudioQualityInfo()
+            activeResolvedQuality = immediateQuality
+
+            val immediateTrack = track.copy(
+                uriString = immediateCandidate.directStreamUrl,
+                format = mapFormatStringToEnum(immediateCandidate.formatName, track.format),
+                bitrateKbps = immediateCandidate.bitrateKbps,
+                sampleRate = immediateCandidate.sampleRateHz,
+                bitDepth = immediateCandidate.bitDepth,
+                sourceProvider = immediateCandidate.providerName
+            )
+
+            val updatedQueue = if (effectiveQueue.any { it.id == immediateTrack.id }) {
+                effectiveQueue.map { if (it.id == immediateTrack.id) immediateTrack else it }
+            } else {
+                listOf(immediateTrack) + effectiveQueue
+            }
+
+            currentPlaylist = updatedQueue
+            pendingTrack = immediateTrack
+            pendingQuality = immediateQuality
+            _isLoadingTrack.value = true
+
+            val initialMediaItem = createMediaItemForTrack(immediateTrack, isActiveTrack = true)
+            exoPlayer.pauseAtEndOfMediaItems = !isGaplessEnabled
+            exoPlayer.setMediaItem(initialMediaItem, /* startPositionMs = */ 0L)
+            exoPlayer.prepare()
+            exoPlayer.playWhenReady = true
+            exoPlayer.play()
+            // State changes are dispatched only when onPlaybackStateChanged(STATE_READY) is received
+        } else {
+            // No cached candidate yet; set pending state and resolve genuine stream asynchronously
+            pendingTrack = track
+            pendingQuality = null
+            _isLoadingTrack.value = true
+            currentPlaylist = effectiveQueue
+        }
 
         // Step 3: Run full stream resolution & format probing asynchronously in the background
         playbackSwitchJob = scope.launch {
@@ -563,13 +533,14 @@ class ExoPlayerAudioEngine(private val context: Context) {
                     // streams[0] is strictly the highest quality: BitDepth DESC -> SampleRate DESC -> Bitrate DESC
                     val topCandidate = fullCandidates.first()
 
-                    // If a superior quality stream exists (e.g. Amazon Ultra HD / Deezer HiFi FLAC instead of lossy/fallback),
-                    // or stream URL upgraded, seamlessly switch to it while preserving exact playback position
-                    val shouldUpgrade = topCandidate.directStreamUrl != immediateCandidate.directStreamUrl &&
-                        ((topCandidate.isLossless && !immediateCandidate.isLossless) ||
-                            topCandidate.bitDepth > immediateCandidate.bitDepth ||
-                            topCandidate.sampleRateHz > immediateCandidate.sampleRateHz ||
-                            topCandidate.bitrateKbps > immediateCandidate.bitrateKbps)
+                    // If immediateCandidate was null, or a superior quality stream exists, switch stream
+                    val shouldUpgrade = immediateCandidate == null || (
+                        topCandidate.directStreamUrl != immediateCandidate.directStreamUrl &&
+                            ((topCandidate.isLossless && !immediateCandidate.isLossless) ||
+                                topCandidate.bitDepth > immediateCandidate.bitDepth ||
+                                topCandidate.sampleRateHz > immediateCandidate.sampleRateHz ||
+                                topCandidate.bitrateKbps > immediateCandidate.bitrateKbps)
+                    )
 
                     if (shouldUpgrade) {
                         currentCandidateIndex = 0
@@ -587,17 +558,16 @@ class ExoPlayerAudioEngine(private val context: Context) {
 
                         if (!isActive || requestId != activeSwitchRequestId) return@launch
 
-                        currentTrack = upgradedTrack
-                        _currentTrackState.value = upgradedTrack
-                        _audioQualityState.value = topCandidate.toAudioQualityInfo()
+                        pendingTrack = upgradedTrack
+                        pendingQuality = topCandidate.toAudioQualityInfo()
 
-                        // Atomic stream switching: stop, clear, reset decoder, and play at current position
+                        // Atomic stream switching: stop, clear, reset decoder, and play
                         AudioPlayerService.switchStreamAtomically(
                             exoPlayer = exoPlayer,
                             context = context,
                             track = upgradedTrack,
                             candidate = topCandidate,
-                            preservePosition = true
+                            preservePosition = (immediateCandidate != null)
                         )
                     } else {
                         // Dynamically update audio pill metadata badge from probed headers without stalling playback
@@ -605,6 +575,11 @@ class ExoPlayerAudioEngine(private val context: Context) {
                         _audioQualityState.value = topCandidate.toAudioQualityInfo()
                         activeResolvedQuality = topCandidate.toAudioQualityInfo()
                     }
+                } else {
+                    if (!isActive || requestId != activeSwitchRequestId) return@launch
+                    _isLoadingTrack.value = false
+                    isSwitchingTrack = false
+                    _playbackError.value = "Playback unavailable for '${track.title}'. Stream could not be reached."
                 }
             } catch (e: CancellationException) {
                 throw e
@@ -805,11 +780,8 @@ class ExoPlayerAudioEngine(private val context: Context) {
                 else -> null
             }
             Pair(parsedUri, mime)
-        } else if (isActiveTrack) {
-            // Synthesize PCM WAV only for the active track if no direct stream URI was resolved
-            Pair(getCachedWavUriForTrack(track), MimeTypes.AUDIO_WAV)
         } else {
-            // Non-active queued tracks resolve lazily on transition so switching tracks is instantaneous
+            // Lazy placeholder for queued tracks or un-probed tracks awaiting resolution
             Pair(Uri.parse("https://stream.flowaudio.io/pending/${track.id}"), null)
         }
 
@@ -852,78 +824,6 @@ class ExoPlayerAudioEngine(private val context: Context) {
     fun toggleFavoriteCurrentTrack() {
         val track = currentTrack ?: return
         onFavoriteToggleRequested?.invoke(track)
-    }
-
-    /**
-     * Generates a full-duration lossless 44.1kHz 16-bit stereo PCM WAV file in the app's cache
-     * so Media3 ExoPlayer plays full-length sample/fallback tracks without 16s or 30s cutoffs.
-     */
-    private fun getCachedWavUriForTrack(track: AudioTrack): Uri {
-        val wavFile = UniversalStreamResolver.getOrCreateTrackAudioFile(context, track)
-        return Uri.fromFile(wavFile)
-    }
-
-    private fun writeWavHeader(
-        out: OutputStream,
-        totalAudioLen: Int,
-        sampleRate: Int,
-        channels: Int,
-        bitsPerSample: Int
-    ) {
-        val totalDataLen = totalAudioLen + 36
-        val byteRate = sampleRate * channels * bitsPerSample / 8
-        val blockAlign = channels * bitsPerSample / 8
-
-        val header = ByteArray(44)
-        // RIFF chunk descriptor
-        header[0] = 'R'.code.toByte()
-        header[1] = 'I'.code.toByte()
-        header[2] = 'F'.code.toByte()
-        header[3] = 'F'.code.toByte()
-        header[4] = (totalDataLen and 0xff).toByte()
-        header[5] = (totalDataLen shr 8 and 0xff).toByte()
-        header[6] = (totalDataLen shr 16 and 0xff).toByte()
-        header[7] = (totalDataLen shr 24 and 0xff).toByte()
-        header[8] = 'W'.code.toByte()
-        header[9] = 'A'.code.toByte()
-        header[10] = 'V'.code.toByte()
-        header[11] = 'E'.code.toByte()
-        // fmt sub-chunk
-        header[12] = 'f'.code.toByte()
-        header[13] = 'm'.code.toByte()
-        header[14] = 't'.code.toByte()
-        header[15] = ' '.code.toByte()
-        header[16] = 16 // 16 for PCM
-        header[17] = 0
-        header[18] = 0
-        header[19] = 0
-        header[20] = 1 // Audio format 1 = PCM
-        header[21] = 0
-        header[22] = channels.toByte()
-        header[23] = 0
-        header[24] = (sampleRate and 0xff).toByte()
-        header[25] = (sampleRate shr 8 and 0xff).toByte()
-        header[26] = (sampleRate shr 16 and 0xff).toByte()
-        header[27] = (sampleRate shr 24 and 0xff).toByte()
-        header[28] = (byteRate and 0xff).toByte()
-        header[29] = (byteRate shr 8 and 0xff).toByte()
-        header[30] = (byteRate shr 16 and 0xff).toByte()
-        header[31] = (byteRate shr 24 and 0xff).toByte()
-        header[32] = blockAlign.toByte()
-        header[33] = 0
-        header[34] = bitsPerSample.toByte()
-        header[35] = 0
-        // data sub-chunk
-        header[36] = 'd'.code.toByte()
-        header[37] = 'a'.code.toByte()
-        header[38] = 't'.code.toByte()
-        header[39] = 'a'.code.toByte()
-        header[40] = (totalAudioLen and 0xff).toByte()
-        header[41] = (totalAudioLen shr 8 and 0xff).toByte()
-        header[42] = (totalAudioLen shr 16 and 0xff).toByte()
-        header[43] = (totalAudioLen shr 24 and 0xff).toByte()
-
-        out.write(header, 0, 44)
     }
 
     fun release() {

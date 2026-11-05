@@ -265,9 +265,14 @@ fun NowPlayingSheet(
             Spacer(modifier = Modifier.height(6.dp))
 
             // Full Song Stream Provider Badge (Click to cycle real stream candidates: [Deezer HiFi FLAC], [Amazon Ultra HD], [Tidal Master], [JioSaavn 320k])
-            val displayedStream = activeStreamCandidateName?.takeIf { it.isNotBlank() }
+            val rawStream = activeStreamCandidateName?.takeIf { it.isNotBlank() }
                 ?: track.sourceProvider.takeIf { it.isNotBlank() }
                 ?: streamBackend.label
+            val displayedStream = when {
+                rawStream.startsWith("Stream:", ignoreCase = true) -> rawStream
+                rawStream.startsWith("[") && rawStream.endsWith("]") -> "Stream: $rawStream"
+                else -> "Stream: [$rawStream]"
+            }
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.Center,
@@ -280,7 +285,7 @@ fun NowPlayingSheet(
                     .testTag("stream_backend_badge")
             ) {
                 Text(
-                    text = "Stream: [$displayedStream]",
+                    text = displayedStream,
                     fontSize = 10.sp,
                     fontWeight = FontWeight.SemiBold,
                     color = TextPrimaryDark

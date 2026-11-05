@@ -488,7 +488,7 @@ object UniversalStreamResolver {
             }
         }
 
-        // 2. Local SAF import
+        // 3. Local SAF import
         if (track.isLocalImport && !track.uriString.isNullOrBlank()) {
             val sr = track.sampleRate.takeIf { it > 0 } ?: 44100
             val bd = track.bitDepth.takeIf { it > 0 } ?: 16
@@ -507,25 +507,6 @@ object UniversalStreamResolver {
                     bitrateKbps = br,
                     isLossless = track.format.isLossless,
                     providerName = "Local Storage"
-                )
-            )
-        }
-
-        // 3. Built-in Offline Studio Master tracks or explicit Local Lossless backend
-        if (backend == StreamBackend.LOCAL_LOSSLESS || (!track.isGlobalOnline && track.uriString.isNullOrBlank())) {
-            val localWav = getOrCreateTrackAudioFile(context, track)
-            val sr = track.sampleRate.takeIf { it > 0 } ?: 44100
-            val bd = track.bitDepth.takeIf { it > 0 } ?: 16
-            val exactWavBitrate = (sr * 2 * bd) / 1000
-            return@withContext listOf(
-                ResolvedStreamCandidate(
-                    streamUrl = localWav.absolutePath,
-                    formatName = "WAV",
-                    sampleRateHz = sr,
-                    bitDepth = bd,
-                    bitrateKbps = exactWavBitrate,
-                    isLossless = true,
-                    providerName = "Local Lossless Master"
                 )
             )
         }
@@ -605,7 +586,7 @@ object UniversalStreamResolver {
 
         // Probe real stream metadata (container headers, exact Content-Length bitrate, bit-depth, sample rate)
         val probedNetwork = initialSorted.map { cand ->
-            val probed = StreamMetadataProbe.probeStream(
+            val probed = com.example.audio.AudioMetadataProber.probeStream(
                 url = cand.streamUrl,
                 durationMs = track.durationMs,
                 fallbackFormat = cand.formatName,
@@ -613,12 +594,22 @@ object UniversalStreamResolver {
                 fallbackSampleRate = cand.sampleRateHz,
                 fallbackBitDepth = cand.bitDepth
             )
+            val isLossyContainer = !probed.isLossless || probed.formatName in listOf("AAC", "OPUS", "MP3")
+            val cleanProvider = when {
+                cand.streamUrl.contains("saavn", true) -> "JioSaavn (320 kbps AAC)"
+                cand.streamUrl.contains("googlevideo", true) || cand.providerName.contains("YouTube", true) -> "YouTube Music (HQ Opus)"
+                isLossyContainer && (cand.providerName.contains("Amazon", true) || cand.providerName.contains("Deezer", true) || cand.providerName.contains("Tidal", true) || cand.providerName.contains("FLAC", true)) -> {
+                    if (cand.streamUrl.contains("saavn", true)) "JioSaavn (320 kbps AAC)" else "YouTube Music (HQ Opus)"
+                }
+                else -> cand.providerName
+            }
             cand.copy(
                 formatName = probed.formatName,
                 sampleRateHz = probed.sampleRateHz,
                 bitDepth = probed.bitDepth,
                 bitrateKbps = probed.bitrateKbps,
-                isLossless = probed.isLossless,
+                isLossless = probed.isLossless && !isLossyContainer,
+                providerName = cleanProvider,
                 sourceTrackId = track.id,
                 directStreamUrl = cand.streamUrl
             )
@@ -626,24 +617,17 @@ object UniversalStreamResolver {
 
         val sortedNetwork = sortStreamCandidates(probedNetwork)
 
-        // 8. Always guarantee audio playback! Never refuse or halt playback for a selected track.
+        // 8. Under NO circumstance should synthetic PCM audio or silent mock frames be generated when a network stream fails.
+        // Playback must always be genuine network audio streams.
         val finalCandidates = if (sortedNetwork.isNotEmpty()) {
             sortedNetwork
         } else {
-            val fallbackFile = getOrCreateTrackAudioFile(context, track)
-            listOf(
-                ResolvedStreamCandidate(
-                    streamUrl = fallbackFile.absolutePath,
-                    formatName = if (track.format.isLossless) track.format.displayName else "PCM WAV",
-                    sampleRateHz = track.sampleRate.takeIf { it > 0 } ?: 44100,
-                    bitDepth = track.bitDepth.takeIf { it > 0 } ?: 16,
-                    bitrateKbps = track.bitrateKbps.takeIf { it > 0 } ?: 1411,
-                    isLossless = true,
-                    providerName = "Offline Studio Master",
-                    sourceTrackId = track.id,
-                    directStreamUrl = fallbackFile.absolutePath
-                )
-            )
+            val emergencySaavn = resolveFromOfficialJioSaavn(track.title, track.artist)
+            if (emergencySaavn != null) {
+                buildCandidatesFromBaseUrl(emergencySaavn.first, track)
+            } else {
+                emptyList()
+            }
         }
 
         if (finalCandidates.isNotEmpty()) {
@@ -763,7 +747,7 @@ object UniversalStreamResolver {
      * Instantly (<10ms) resolves the immediate stream candidate for zero-latency playback startup.
      * Uses cached stream candidate, offline file, or direct URL without blocking on network waterfall.
      */
-    fun getImmediateStreamCandidate(context: Context, track: AudioTrack): ResolvedStreamCandidate {
+    fun getImmediateStreamCandidate(context: Context, track: AudioTrack): ResolvedStreamCandidate? {
         // 1. Cached candidate for this track
         getTopResolvedCandidateForTrack(track.id)?.let { return it }
 
@@ -814,28 +798,14 @@ object UniversalStreamResolver {
                 bitDepth = track.bitDepth.coerceAtLeast(16),
                 bitrateKbps = br,
                 isLossless = isLossless,
-                providerName = track.sourceProvider.ifBlank { "JioSaavn 320k" },
+                providerName = track.sourceProvider.ifBlank { "JioSaavn (320 kbps AAC)" },
                 sourceTrackId = track.id,
                 directStreamUrl = track.uriString
             )
         }
 
-        // 5. Offline Studio Master procedural audio (guarantees instantaneous playback in <10ms)
-        val wavFile = getOrCreateTrackAudioFile(context, track)
-        val sr = track.sampleRate.takeIf { it > 0 } ?: 44100
-        val bd = track.bitDepth.takeIf { it > 0 } ?: 16
-        val br = (sr * 2 * bd) / 1000
-        return ResolvedStreamCandidate(
-            streamUrl = wavFile.absolutePath,
-            formatName = "WAV",
-            sampleRateHz = sr,
-            bitDepth = bd,
-            bitrateKbps = br,
-            isLossless = true,
-            providerName = "Offline Studio Master",
-            sourceTrackId = track.id,
-            directStreamUrl = wavFile.absolutePath
-        )
+        // Under NO circumstance generate synthetic PCM audio. Return null so the player resolves genuine network streams asynchronously.
+        return null
     }
 
     /**
@@ -1675,100 +1645,5 @@ object UniversalStreamResolver {
         }
         return null
     }
-
-    /**
-     * Generates a full-length (matching track duration, minimum 180 seconds) stereo WAV file
-     * for offline procedural tracks so they NEVER cut off after 16 or 30 seconds,
-     * and maps each track strictly to its own unique file path.
-     */
-    fun getOrCreateTrackAudioFile(context: Context, track: AudioTrack): File {
-        val cacheDir = File(context.cacheDir, "audio_lossless")
-        if (!cacheDir.exists()) cacheDir.mkdirs()
-
-        val safeId = track.id.replace(Regex("[^a-zA-Z0-9_-]"), "_")
-        val targetDurationSecs = ((track.durationMs / 1000L).toInt()).coerceIn(180, 300)
-        val wavFile = File(cacheDir, "${safeId}_${track.synthPreset}_full_${targetDurationSecs}s.wav")
-        if (wavFile.exists() && wavFile.length() > 5_000_000L) {
-            return wavFile
-        }
-
-        try {
-            val sampleRate = com.example.audio.PcmAudioSynthesizer.SAMPLE_RATE
-            val cycleSecs = 16
-            val totalSamplesPerChannel = sampleRate * targetDurationSecs
-            val totalBytes = totalSamplesPerChannel * 2 * 2
-
-            val cycleBytes = ByteArray(sampleRate * cycleSecs * 4)
-            var offset = 0
-            for (sec in 0 until cycleSecs) {
-                val pcmChunk = com.example.audio.PcmAudioSynthesizer.generateChunk(
-                    preset = track.synthPreset,
-                    secondInTrack = sec,
-                    sampleCount = sampleRate,
-                    bassMultiplier = 1.0f,
-                    trebleMultiplier = 1.0f,
-                    virtualizerWidth = 0.2f
-                )
-                val byteBuffer = ByteBuffer.allocate(pcmChunk.size * 2).order(ByteOrder.LITTLE_ENDIAN)
-                for (sample in pcmChunk) {
-                    byteBuffer.putShort(sample)
-                }
-                val arr = byteBuffer.array()
-                System.arraycopy(arr, 0, cycleBytes, offset, arr.size)
-                offset += arr.size
-            }
-
-            BufferedOutputStream(FileOutputStream(wavFile), 65536).use { bos ->
-                writeWavHeader(bos, totalBytes, sampleRate, 2, 16)
-                var bytesRemaining = totalBytes
-                while (bytesRemaining > 0) {
-                    val toWrite = minOf(bytesRemaining, cycleBytes.size)
-                    bos.write(cycleBytes, 0, toWrite)
-                    bytesRemaining -= toWrite
-                }
-                bos.flush()
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-        return wavFile
-    }
-
-    private fun writeWavHeader(
-        out: OutputStream,
-        totalAudioLen: Int,
-        sampleRate: Int,
-        channels: Int,
-        bitsPerSample: Int
-    ) {
-        val byteRate = sampleRate * channels * bitsPerSample / 8
-        val totalDataLen = totalAudioLen + 36
-        val header = ByteArray(44)
-        header[0] = 'R'.code.toByte(); header[1] = 'I'.code.toByte(); header[2] = 'F'.code.toByte(); header[3] = 'F'.code.toByte()
-        header[4] = (totalDataLen and 0xff).toByte()
-        header[5] = ((totalDataLen shr 8) and 0xff).toByte()
-        header[6] = ((totalDataLen shr 16) and 0xff).toByte()
-        header[7] = ((totalDataLen shr 24) and 0xff).toByte()
-        header[8] = 'W'.code.toByte(); header[9] = 'A'.code.toByte(); header[10] = 'V'.code.toByte(); header[11] = 'E'.code.toByte()
-        header[12] = 'f'.code.toByte(); header[13] = 'm'.code.toByte(); header[14] = 't'.code.toByte(); header[15] = ' '.code.toByte()
-        header[16] = 16; header[17] = 0; header[18] = 0; header[19] = 0
-        header[20] = 1; header[21] = 0
-        header[22] = channels.toByte(); header[23] = 0
-        header[24] = (sampleRate and 0xff).toByte()
-        header[25] = ((sampleRate shr 8) and 0xff).toByte()
-        header[26] = ((sampleRate shr 16) and 0xff).toByte()
-        header[27] = ((sampleRate shr 24) and 0xff).toByte()
-        header[28] = (byteRate and 0xff).toByte()
-        header[29] = ((byteRate shr 8) and 0xff).toByte()
-        header[30] = ((byteRate shr 16) and 0xff).toByte()
-        header[31] = ((byteRate shr 24) and 0xff).toByte()
-        header[32] = (channels * bitsPerSample / 8).toByte(); header[33] = 0
-        header[34] = bitsPerSample.toByte(); header[35] = 0
-        header[36] = 'd'.code.toByte(); header[37] = 'a'.code.toByte(); header[38] = 't'.code.toByte(); header[39] = 'a'.code.toByte()
-        header[40] = (totalAudioLen and 0xff).toByte()
-        header[41] = ((totalAudioLen shr 8) and 0xff).toByte()
-        header[42] = ((totalAudioLen shr 16) and 0xff).toByte()
-        header[43] = ((totalAudioLen shr 24) and 0xff).toByte()
-        out.write(header, 0, 44)
-    }
 }
+

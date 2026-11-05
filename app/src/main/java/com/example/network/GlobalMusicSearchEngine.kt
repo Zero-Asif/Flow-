@@ -143,13 +143,19 @@ object GlobalMusicSearchEngine {
     }
 
     /**
-     * Module 2: Advanced Relevance Ranking & Tokenization with Fuzzy Typo Tolerance:
+     * Module 2: Advanced Relevance Ranking & Tokenization with Fuzzy Typo Tolerance & Popularity:
      * Splits queries into individual tokens (e.g., "arefin", "rumey", "moner" or "arijit sing")
-     * and ranks by: Exact Phrase Match > Prefix Match > Fuzzy Token Match > Release Year.
+     * and ranks by: Exact Phrase Match > Play Count / View Popularity > Prefix Match > Fuzzy Token Match > Release Year,
+     * while penalizing unverified covers, tributes, and karaoke versions.
      */
     fun computeSearchRelevanceScore(track: AudioTrack, query: String): Int {
         val normQuery = normalizeMatchKey(query)
         if (normQuery.isBlank()) return 100
+
+        // Penalize cover, karaoke, tribute, and slowed/reverb versions when user didn't ask for one
+        if (StreamMatcher.isDisqualifiedCoverOrRemix(track.title, track.artist, query)) {
+            return -500
+        }
 
         val normTitle = normalizeMatchKey(track.title)
         val normArtist = normalizeMatchKey(track.artist)
@@ -163,14 +169,14 @@ object GlobalMusicSearchEngine {
 
         var score = 0
 
-        // 1. Exact Phrase Match
+        // 1. Exact Phrase Match (including official film soundtrack titles like "Aaj Ki Raat (From \"Stree 2\")")
         if (normTitle == normQuery) {
             score += 1000
         } else if (combined == normQuery || "$normArtist $normTitle" == normQuery) {
             score += 950
         } else if (normTitle.startsWith(normQuery)) {
             // 2. Prefix Match
-            score += 800
+            score += 850
         } else if (normArtist == normQuery || normArtist.startsWith(normQuery)) {
             score += 750
         } else if (normTitle.contains(normQuery)) {
@@ -200,7 +206,25 @@ object GlobalMusicSearchEngine {
             score += (tokenCoverage * 500.0).toInt()
         }
 
-        // 4. Album match bonus & Release Year tie-breaker
+        // 4. Official Soundtrack / Original Motion Picture & Multi-Artist Credits Bonus
+        val rawTitleLower = track.title.lowercase()
+        if (rawTitleLower.contains("from \"") || rawTitleLower.contains("(from ") || track.artist.contains(",")) {
+            score += 80
+        }
+
+        // 5. View Count / Playback Popularity Boost (Descending)
+        val popularityBoost = when {
+            track.playCount >= 50_000_000 -> 450
+            track.playCount >= 10_000_000 -> 380
+            track.playCount >= 1_000_000 -> 300
+            track.playCount >= 100_000 -> 200
+            track.playCount >= 10_000 -> 100
+            track.playCount > 0 -> 40
+            else -> 0
+        }
+        score += popularityBoost
+
+        // 6. Album match bonus & Release Year tie-breaker
         if (normAlbum == normQuery) score += 120
         score += (track.releaseYear.coerceIn(1970, 2026) - 1970)
 
@@ -208,13 +232,16 @@ object GlobalMusicSearchEngine {
     }
 
     /**
-     * Ranks tracks combining search relevance (exact/prefix/fuzzy token match) and quality cascade.
+     * Ranks tracks combining search relevance (exact/prefix/fuzzy token match), playback popularity (playCount),
+     * and audiophile quality cascade.
      */
     fun rankTracksByQueryAndQuality(tracks: List<AudioTrack>, query: String): List<AudioTrack> {
         if (query.isBlank()) return sortTracksByQualityCascade(tracks)
         return tracks.sortedWith(
-            compareByDescending<AudioTrack> { computeSearchRelevanceScore(it, query) >= 450 }
-                .thenByDescending { computeSearchRelevanceScore(it, query) / 150 }
+            compareByDescending<AudioTrack> { !StreamMatcher.isDisqualifiedCoverOrRemix(it.title, it.artist, query) }
+                .thenByDescending { computeSearchRelevanceScore(it, query) >= 450 }
+                .thenByDescending { computeSearchRelevanceScore(it, query) / 120 }
+                .thenByDescending { it.playCount }
                 .thenByDescending { it.format.isLossless }
                 .thenByDescending { it.bitDepth }
                 .thenByDescending { if (it.format.isLossless) it.sampleRate else it.bitrateKbps }
@@ -339,7 +366,7 @@ object GlobalMusicSearchEngine {
     /**
      * Module 1: Strict Audio Matching Engine for Direct Stream Hydration
      * Computes Multi-Factor Identity Confidence Score (0-100%) and ONLY binds a direct stream URL
-     * if confidence >= 85% (HARD_MATCH_THRESHOLD) and duration is within ±3 seconds.
+     * if confidence >= HARD_MATCH_THRESHOLD, title-artist verification passes, and duration is within ±3 seconds.
      */
     private fun findMatchingDirectStream(
         candidate: AudioTrack,
@@ -354,8 +381,16 @@ object GlobalMusicSearchEngine {
         for (poolTrack in streamPool) {
             val streamUri = poolTrack.uriString
             if (streamUri.isNullOrBlank()) continue
-            val poolDurationSec = (poolTrack.durationMs / 1000L).coerceAtLeast(0L)
+            if (StreamMatcher.isDisqualifiedCoverOrRemix(poolTrack.title, poolTrack.artist, candidate.title)) continue
 
+            // Enforce ±3 second duration sanity check when both durations are known
+            if (candidate.durationMs > 10_000L && poolTrack.durationMs > 10_000L) {
+                if (!StreamMatcher.isDurationValid(poolTrack.durationMs, candidate.durationMs)) {
+                    continue
+                }
+            }
+
+            val poolDurationSec = (poolTrack.durationMs / 1000L).coerceAtLeast(0L)
             val confidence = UniversalStreamResolver.computeMatchConfidenceScore(
                 candidateTitle = poolTrack.title,
                 candidateArtist = poolTrack.artist,
@@ -417,73 +452,92 @@ object GlobalMusicSearchEngine {
             MusicSourceFilter.JIOSAAVN -> rankTracksByQueryAndQuality(searchJioSaavn(query, limit), query)
             MusicSourceFilter.YOUTUBE -> rankTracksByQueryAndQuality(searchYouTubeMusic(query, limit), query)
             MusicSourceFilter.ALL -> {
+                val ytDeferred = async { searchYouTubeMusic(query, limit) }
+                val saavnDeferred = async { searchJioSaavn(query, limit) }
                 val amazonDeferred = async { searchAmazonMusic(query, limit) }
                 val deezerDeferred = async { searchDeezer(query, limit) }
                 val tidalDeferred = async { searchTidal(query, limit) }
-                val saavnDeferred = async { searchJioSaavn(query, limit) }
-                val ytDeferred = async { searchYouTubeMusic(query, limit) }
 
+                val yt = ytDeferred.await()
+                val saavn = saavnDeferred.await()
                 val amazon = amazonDeferred.await()
                 val deezer = deezerDeferred.await()
                 val tidal = tidalDeferred.await()
-                val saavn = saavnDeferred.await()
-                val yt = ytDeferred.await()
 
-                // 1. Identify canonical masterpiece version from YouTube search by view count & query relevance
-                val canonicalYt = yt.filter { track ->
-                    computeSearchRelevanceScore(track, query) >= 250
-                }.maxByOrNull { it.playCount } ?: yt.firstOrNull()
+                // 1. Canonical Metadata Lookup:
+                // Filter and rank candidates from YouTube Music & JioSaavn by View Count / Playback Popularity (Descending)
+                // so the official original soundtrack (e.g., "Aaj Ki Raat" from "Stree 2") always wins over cover artists.
+                val popularityPool = (saavn + yt).filter { track ->
+                    !StreamMatcher.isDisqualifiedCoverOrRemix(track.title, track.artist, query) &&
+                        computeSearchRelevanceScore(track, query) >= 250
+                }
+                val topPopularTrack = popularityPool.maxWithOrNull(
+                    compareBy<AudioTrack> { it.playCount }
+                        .thenBy { computeSearchRelevanceScore(it, query) }
+                ) ?: yt.firstOrNull() ?: saavn.firstOrNull()
 
-                // 2. Resolve canonical track through Lossless Waterfall: Amazon Ultra HD -> Deezer HiFi -> Tidal Master -> JioSaavn 320k -> YouTube Music
-                val canonicalMaster = if (canonicalYt != null) {
-                    val normCanonicalTitle = normalizeMatchKey(canonicalYt.title)
-                    val normCanonicalArtist = normalizeMatchKey(canonicalYt.artist.split(",", "&", "feat.", "ft.").firstOrNull().orEmpty())
-
-                    amazon.firstOrNull {
-                        val sim = UniversalStreamResolver.calculateLevenshteinSimilarity(normalizeMatchKey(it.title), normCanonicalTitle)
-                        val artSim = if (normCanonicalArtist.isNotBlank()) {
-                            UniversalStreamResolver.calculateLevenshteinSimilarity(normalizeMatchKey(it.artist), normCanonicalArtist)
-                        } else 1.0
-                        sim >= 0.70 || (sim >= 0.55 && artSim >= 0.60)
-                    } ?: deezer.firstOrNull {
-                        val sim = UniversalStreamResolver.calculateLevenshteinSimilarity(normalizeMatchKey(it.title), normCanonicalTitle)
-                        val artSim = if (normCanonicalArtist.isNotBlank()) {
-                            UniversalStreamResolver.calculateLevenshteinSimilarity(normalizeMatchKey(it.artist), normCanonicalArtist)
-                        } else 1.0
-                        sim >= 0.70 || (sim >= 0.55 && artSim >= 0.60)
-                    } ?: tidal.firstOrNull {
-                        val sim = UniversalStreamResolver.calculateLevenshteinSimilarity(normalizeMatchKey(it.title), normCanonicalTitle)
-                        val artSim = if (normCanonicalArtist.isNotBlank()) {
-                            UniversalStreamResolver.calculateLevenshteinSimilarity(normalizeMatchKey(it.artist), normCanonicalArtist)
-                        } else 1.0
-                        sim >= 0.70 || (sim >= 0.55 && artSim >= 0.60)
-                    } ?: saavn.firstOrNull {
-                        val sim = UniversalStreamResolver.calculateLevenshteinSimilarity(normalizeMatchKey(it.title), normCanonicalTitle)
-                        val artSim = if (normCanonicalArtist.isNotBlank()) {
-                            UniversalStreamResolver.calculateLevenshteinSimilarity(normalizeMatchKey(it.artist), normCanonicalArtist)
-                        } else 1.0
-                        sim >= 0.70 || (sim >= 0.55 && artSim >= 0.60)
-                    } ?: canonicalYt
+                // Extract canonical ISRC, Title, Primary Artist, and Exact Duration (ms) via StreamMatcher
+                val canonicalMetadata = if (topPopularTrack != null) {
+                    StreamMatcher.resolveCanonicalTrack(
+                        rawTitle = topPopularTrack.title,
+                        rawArtist = topPopularTrack.artist,
+                        fallbackDurationMs = topPopularTrack.durationMs
+                    )
                 } else null
 
-                val canonicalDirectStream = if (canonicalMaster != null) findMatchingDirectStream(canonicalMaster, saavn) else null
-                val hydratedCanonical = if (canonicalMaster != null && canonicalMaster.uriString.isNullOrBlank() && canonicalDirectStream != null) {
-                    canonicalMaster.copy(uriString = canonicalDirectStream)
-                } else {
-                    canonicalMaster
+                val canonicalRefTitle = canonicalMetadata?.canonicalTitle ?: topPopularTrack?.title.orEmpty()
+                val canonicalRefArtist = canonicalMetadata?.primaryArtist ?: topPopularTrack?.artist.orEmpty()
+                val canonicalRefDurationMs = canonicalMetadata?.durationMs ?: topPopularTrack?.durationMs ?: 0L
+                val maxObservedPlayCount = maxOf(topPopularTrack?.playCount ?: 0, 1_000_000)
+
+                // Helper that enforces title-artist verification, rejects covers/tributes, and rejects duration discrepancy > ±3s
+                val matchesCanonicalOriginal: (AudioTrack) -> Boolean = { candidate ->
+                    !StreamMatcher.isDisqualifiedCoverOrRemix(candidate.title, candidate.artist, query) &&
+                        StreamMatcher.isDurationValid(candidate.durationMs, canonicalRefDurationMs) &&
+                        UniversalStreamResolver.computeMatchConfidenceScore(
+                            candidateTitle = candidate.title,
+                            candidateArtist = candidate.artist,
+                            targetTitle = canonicalRefTitle,
+                            targetArtist = canonicalRefArtist,
+                            durationSec = candidate.durationMs / 1000L,
+                            targetDurationSec = canonicalRefDurationMs / 1000L
+                        ) >= 75
                 }
 
+                // 2. Resolve canonical track through Lossless Waterfall: Amazon Ultra HD -> Deezer HiFi -> Tidal Master -> JioSaavn -> YouTube Music
+                val canonicalMaster = if (topPopularTrack != null) {
+                    amazon.firstOrNull(matchesCanonicalOriginal)
+                        ?: deezer.firstOrNull(matchesCanonicalOriginal)
+                        ?: tidal.firstOrNull(matchesCanonicalOriginal)
+                        ?: saavn.firstOrNull(matchesCanonicalOriginal)
+                        ?: topPopularTrack
+                } else null
+
+                val canonicalDirectStream = if (canonicalMaster != null) {
+                    findMatchingDirectStream(canonicalMaster, saavn) ?: topPopularTrack?.uriString
+                } else null
+                val hydratedCanonical = canonicalMaster?.copy(
+                    uriString = canonicalMaster.uriString ?: canonicalDirectStream,
+                    playCount = maxOf(canonicalMaster.playCount, maxObservedPlayCount)
+                )
+
                 // Strict Provider Waterfall Order: Amazon Music -> Deezer -> Tidal -> JioSaavn -> YouTube Music
-                val waterfallCandidates = amazon + deezer + tidal + saavn + yt
+                // Filter out cover/tribute tracks when user did not explicitly search for a cover
+                val waterfallCandidates = (amazon + deezer + tidal + saavn + yt).filter { candidate ->
+                    !StreamMatcher.isDisqualifiedCoverOrRemix(candidate.title, candidate.artist, query)
+                }
                 val merged = mutableListOf<AudioTrack>()
 
                 for (candidate in waterfallCandidates) {
                     val directStreamUrl = findMatchingDirectStream(candidate, saavn)
-                    val hydratedCandidate = if (candidate.uriString.isNullOrBlank() && directStreamUrl != null) {
-                        candidate.copy(uriString = directStreamUrl)
-                    } else {
-                        candidate
-                    }
+                    val matchingSaavnPlayCount = saavn.firstOrNull {
+                        normalizeMatchKey(it.title) == normalizeMatchKey(candidate.title) &&
+                            StreamMatcher.isDurationValid(it.durationMs, candidate.durationMs)
+                    }?.playCount ?: 0
+                    val hydratedCandidate = candidate.copy(
+                        uriString = candidate.uriString ?: directStreamUrl,
+                        playCount = maxOf(candidate.playCount, matchingSaavnPlayCount)
+                    )
 
                     val normTitle = normalizeMatchKey(hydratedCandidate.title)
                     val normArtist = normalizeMatchKey(
@@ -504,6 +558,7 @@ object GlobalMusicSearchEngine {
                     } else {
                         val existing = merged[existingIdx]
                         val combinedUri = existing.uriString ?: hydratedCandidate.uriString
+                        val combinedPlayCount = maxOf(existing.playCount, hydratedCandidate.playCount)
                         val candidateIsHigher = when {
                             hydratedCandidate.bitDepth != existing.bitDepth ->
                                 hydratedCandidate.bitDepth > existing.bitDepth
@@ -518,9 +573,15 @@ object GlobalMusicSearchEngine {
                         }
 
                         if (candidateIsHigher) {
-                            merged[existingIdx] = hydratedCandidate.copy(uriString = combinedUri)
-                        } else if (existing.uriString.isNullOrBlank() && !combinedUri.isNullOrBlank()) {
-                            merged[existingIdx] = existing.copy(uriString = combinedUri)
+                            merged[existingIdx] = hydratedCandidate.copy(
+                                uriString = combinedUri,
+                                playCount = combinedPlayCount
+                            )
+                        } else {
+                            merged[existingIdx] = existing.copy(
+                                uriString = combinedUri ?: existing.uriString,
+                                playCount = combinedPlayCount
+                            )
                         }
                     }
                 }
@@ -530,11 +591,18 @@ object GlobalMusicSearchEngine {
                 // Place canonical masterpiece at index 0 of search results for guaranteed Top Result Best Match
                 if (hydratedCanonical != null) {
                     val normCanonical = normalizeMatchKey(hydratedCanonical.title)
+                    val normCanonicalArt = normalizeMatchKey(
+                        hydratedCanonical.artist.split(",", "&", "feat", "ft").firstOrNull().orEmpty()
+                    )
                     val existingIdx = ranked.indexOfFirst {
-                        normalizeMatchKey(it.title) == normCanonical
+                        normalizeMatchKey(it.title) == normCanonical &&
+                            (normCanonicalArt.isBlank() || normalizeMatchKey(it.artist).contains(normCanonicalArt))
                     }
                     if (existingIdx > 0) {
-                        val matchedTrack = ranked[existingIdx]
+                        val matchedTrack = ranked[existingIdx].copy(
+                            playCount = maxOf(ranked[existingIdx].playCount, hydratedCanonical.playCount),
+                            uriString = ranked[existingIdx].uriString ?: hydratedCanonical.uriString
+                        )
                         listOf(matchedTrack) + ranked.filterIndexed { index, _ -> index != existingIdx }
                     } else if (existingIdx == 0) {
                         ranked
@@ -599,6 +667,10 @@ object GlobalMusicSearchEngine {
                         val durationSec = (moreInfo?.optString("duration", "")?.toLongOrNull()
                             ?: item.optLong("duration", 210L)).coerceAtLeast(60L)
                         val year = item.optString("year", "2025").toIntOrNull() ?: 2025
+                        val playCount = (item.optString("play_count", "").toLongOrNull()
+                            ?: moreInfo?.optString("play_count", "")?.toLongOrNull()
+                            ?: item.optLong("play_count", 0L))
+                            .coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
 
                         // Extract primary artists from artistMap
                         var artist = ""
@@ -665,6 +737,7 @@ object GlobalMusicSearchEngine {
                                     uriString = streamUrl,
                                     artworkUrl = highResArtwork,
                                     isGlobalOnline = true,
+                                    playCount = playCount,
                                     sourceProvider = if (fmt.isLossless) "Hi-Res ${fmt.displayName}" else "JioSaavn ${br}k",
                                     fileSizeFormatted = "$sizeEst ($br kbps ${fmt.displayName})",
                                     lyrics = listOf(
@@ -734,6 +807,9 @@ object GlobalMusicSearchEngine {
                                     ?.replace("&amp;", "&") ?: "Single"
                                 val durationSec = item.optLong("duration", 210L).coerceAtLeast(60L)
                                 val year = item.optString("year", "2024").toIntOrNull() ?: 2024
+                                val playCount = (item.optString("playCount", "").toLongOrNull()
+                                    ?: item.optLong("playCount", 0L))
+                                    .coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
 
                                 var highResArtwork = ""
                                 val images = item.optJSONArray("image")
@@ -787,6 +863,7 @@ object GlobalMusicSearchEngine {
                                             uriString = streamUrl,
                                             artworkUrl = highResArtwork,
                                             isGlobalOnline = true,
+                                            playCount = playCount,
                                             sourceProvider = "JioSaavn 320k",
                                             fileSizeFormatted = "${(320 * durationSec / 8 / 1024).coerceAtLeast(4)} MB (Full 320k Stream)",
                                             lyrics = listOf(
@@ -1184,6 +1261,7 @@ object GlobalMusicSearchEngine {
                         val deezerId = item.optLong("id", 0L)
                         val title = item.optString("title", "")
                         val durationSec = item.optLong("duration", 210L).coerceAtLeast(60L)
+                        val deezerRank = item.optInt("rank", 0)
 
                         val artistObj = item.optJSONObject("artist")
                         val artistName = artistObj?.optString("name", "Unknown Artist") ?: "Unknown Artist"
@@ -1225,6 +1303,7 @@ object GlobalMusicSearchEngine {
                                     uriString = null,
                                     artworkUrl = coverXl,
                                     isGlobalOnline = true,
+                                    playCount = deezerRank,
                                     sourceProvider = "Deezer HiFi",
                                     fileSizeFormatted = "$sizeEst ($br kbps ${fmt.displayName})",
                                     lyrics = listOf(

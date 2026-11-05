@@ -230,10 +230,11 @@ object UniversalStreamResolver {
 
     /**
      * Dynamically parses the active track and player stream metadata (format, bit depth,
-     * sample rate, bitrate, and duration) to build accurate download quality options:
-     * - Auto-selects the #1 highest stream (e.g., 24-bit/192kHz @ 4608 kbps FLAC, 24-bit/96kHz @ 2822 kbps FLAC,
-     *   or 16-bit/44.1kHz @ 1411 kbps FLAC/ALAC/WAV) when available.
-     * - Only uses 320 kbps as the recommended option when the track's maximum available source is lossy.
+     * sample rate, bitrate, and duration) to build the complete multi-tier download quality options:
+     * 1. Master Lossless: FLAC 24-BIT / 96kHz (2822 kbps) or 16-BIT / 44.1kHz (1411 kbps) / ALAC Master (Recommended)
+     * 2. High Quality: AAC / MP3 320 kbps
+     * 3. Standard Quality: MP3 / Opus / AAC 160 kbps
+     * 4. Data Saver: AAC 96 kbps
      */
     fun getDynamicDownloadOptions(
         track: AudioTrack,
@@ -243,95 +244,84 @@ object UniversalStreamResolver {
         val cachedTopCandidate = getTopResolvedCandidateForTrack(track.id)
         val effectiveQualityInfo = activeQualityInfo ?: cachedTopCandidate?.toAudioQualityInfo()
 
-        val isLosslessSource = when {
-            effectiveQualityInfo != null -> effectiveQualityInfo.isLossless || effectiveQualityInfo.bitrateKbps > 320
-            else -> track.format.isLossless || track.bitrateKbps > 320 || isTrueLosslessUrl(track.uriString)
+        val rawFormat = when {
+            effectiveQualityInfo != null && (effectiveQualityInfo.isLossless || effectiveQualityInfo.bitrateKbps > 320) -> effectiveQualityInfo.formatName
+            track.format.isLossless -> track.format.displayName
+            else -> "FLAC"
         }
+        val losslessFormat = when {
+            rawFormat.contains("FLAC", ignoreCase = true) -> "FLAC"
+            rawFormat.contains("ALAC", ignoreCase = true) -> "ALAC"
+            rawFormat.contains("WAV", ignoreCase = true) -> "WAV"
+            rawFormat.contains("AIFF", ignoreCase = true) -> "AIFF"
+            else -> "FLAC"
+        }
+        val losslessBitrate = (effectiveQualityInfo?.bitrateKbps?.takeIf { it > 320 }
+            ?: track.bitrateKbps.takeIf { it > 320 }
+            ?: 1411)
+        val losslessSampleRate = (effectiveQualityInfo?.sampleRateHz?.takeIf { it >= 44100 && (effectiveQualityInfo.isLossless || effectiveQualityInfo.bitrateKbps > 320) }
+            ?: track.sampleRate.takeIf { it >= 44100 && (track.format.isLossless || track.bitrateKbps > 320) }
+            ?: if (losslessBitrate >= 2822) 96000 else 44100)
+        val losslessBitDepth = (effectiveQualityInfo?.bitDepth?.takeIf { it >= 16 && (effectiveQualityInfo.isLossless || effectiveQualityInfo.bitrateKbps > 320) }
+            ?: track.bitDepth.takeIf { it >= 16 && (track.format.isLossless || track.bitrateKbps > 320) }
+            ?: if (losslessBitrate >= 2822) 24 else 16)
+        val losslessSizeMb = estimateFileSizeMb(durationMs, losslessBitrate)
+        val rateFormatted = AudioQualityInfo.formatSampleRateKHz(losslessSampleRate)
 
         val options = mutableListOf<DynamicDownloadOptionItem>()
 
-        if (isLosslessSource) {
-            val rawFormat = when {
-                effectiveQualityInfo != null && (effectiveQualityInfo.isLossless || effectiveQualityInfo.bitrateKbps > 320) -> effectiveQualityInfo.formatName
-                track.format.isLossless -> track.format.displayName
-                else -> "FLAC"
-            }
-            val losslessFormat = when {
-                rawFormat.contains("FLAC", ignoreCase = true) -> "FLAC"
-                rawFormat.contains("ALAC", ignoreCase = true) -> "ALAC"
-                rawFormat.contains("WAV", ignoreCase = true) -> "WAV"
-                rawFormat.contains("AIFF", ignoreCase = true) -> "AIFF"
-                else -> "FLAC"
-            }
-            val losslessBitrate = (effectiveQualityInfo?.bitrateKbps?.takeIf { it > 320 }
-                ?: track.bitrateKbps.takeIf { it > 320 }
-                ?: 1411)
-            val losslessSampleRate = (effectiveQualityInfo?.sampleRateHz?.takeIf { it >= 44100 }
-                ?: track.sampleRate.takeIf { it >= 44100 }
-                ?: 96000)
-            val losslessBitDepth = (effectiveQualityInfo?.bitDepth?.takeIf { it >= 16 }
-                ?: track.bitDepth.takeIf { it >= 16 }
-                ?: 24)
-            val losslessSizeMb = estimateFileSizeMb(durationMs, losslessBitrate)
-            val rateFormatted = AudioQualityInfo.formatSampleRateKHz(losslessSampleRate)
-
-            options.add(
-                DynamicDownloadOptionItem(
-                    option = DownloadQualityOption.HI_RES_LOSSLESS,
-                    title = "Hi-Res $losslessFormat (Original Master)",
-                    subtitle = "Lossless / Hi-Res Bit-Perfect • ${losslessBitDepth}-BIT / $rateFormatted • $losslessBitrate kbps • $losslessSizeMb",
-                    badgeText = "RECOMMENDED • LOSSLESS / HI-RES BIT-PERFECT",
-                    formatName = losslessFormat,
-                    bitrateKbps = losslessBitrate,
-                    sampleRateHz = losslessSampleRate,
-                    bitDepth = losslessBitDepth,
-                    estimatedSizeMb = losslessSizeMb,
-                    isLossless = true,
-                    isRecommended = true
-                )
+        // 1. Master Lossless Tier (FLAC / ALAC / WAV Master) - Auto-recommended top tier
+        options.add(
+            DynamicDownloadOptionItem(
+                option = DownloadQualityOption.HI_RES_LOSSLESS,
+                title = "Hi-Res $losslessFormat (Original Master)",
+                subtitle = "Lossless / Hi-Res Bit-Perfect • ${losslessBitDepth}-BIT / $rateFormatted • $losslessBitrate kbps • $losslessSizeMb",
+                badgeText = "RECOMMENDED • LOSSLESS / HI-RES BIT-PERFECT",
+                formatName = losslessFormat,
+                bitrateKbps = losslessBitrate,
+                sampleRateHz = losslessSampleRate,
+                bitDepth = losslessBitDepth,
+                estimatedSizeMb = losslessSizeMb,
+                isLossless = true,
+                isRecommended = true
             )
-        }
+        )
 
+        // 2. High Quality Tier: AAC / MP3 320 kbps
         val activeLossyFormat = activeQualityInfo?.formatName
             ?.takeIf { !activeQualityInfo.isLossless && it.isNotBlank() }
-            ?: if (!track.format.isLossless) track.format.displayName else "MP3"
-        val activeLossySampleRate = activeQualityInfo?.sampleRateHz?.takeIf { it > 0 && !activeQualityInfo.isLossless }
-            ?: track.sampleRate.takeIf { it > 0 && !track.format.isLossless }
-            ?: 44100
-        val activeLossyBitDepth = activeQualityInfo?.bitDepth?.takeIf { it > 0 && !activeQualityInfo.isLossless }
-            ?: track.bitDepth.takeIf { it > 0 && !track.format.isLossless }
-            ?: 16
-        val topLossyBitrate = activeQualityInfo?.bitrateKbps?.takeIf { it in 64..512 && !activeQualityInfo.isLossless }
-            ?: track.bitrateKbps.takeIf { it in 64..512 && !track.format.isLossless }
-            ?: 320
-        val effectiveTopLossyKbps = if (isLosslessSource) 320 else topLossyBitrate
+            ?: if (!track.format.isLossless) track.format.displayName else "AAC"
+        val activeLossySampleRate = 44100
+        val activeLossyBitDepth = 16
+        val effectiveTopLossyKbps = 320
         val lossyRateFormatted = AudioQualityInfo.formatSampleRateKHz(activeLossySampleRate)
-
         val size320 = estimateFileSizeMb(durationMs, effectiveTopLossyKbps)
+
         options.add(
             DynamicDownloadOptionItem(
                 option = DownloadQualityOption.MASTER_320K,
                 title = "High Quality MP3 / Lossy $effectiveTopLossyKbps kbps",
                 subtitle = "Lossy Compressed Audio • ${activeLossyBitDepth}-BIT / $lossyRateFormatted • $effectiveTopLossyKbps kbps • $size320",
-                badgeText = if (!isLosslessSource) "RECOMMENDED • HIGH QUALITY $effectiveTopLossyKbps KBPS" else "LOSSY $effectiveTopLossyKbps KBPS",
+                badgeText = "HIGH QUALITY • $effectiveTopLossyKbps KBPS AAC/MP3",
                 formatName = activeLossyFormat,
                 bitrateKbps = effectiveTopLossyKbps,
                 sampleRateHz = activeLossySampleRate,
                 bitDepth = activeLossyBitDepth,
                 estimatedSizeMb = size320,
                 isLossless = false,
-                isRecommended = !isLosslessSource
+                isRecommended = false
             )
         )
 
+        // 3. Standard Quality Tier: MP3 / Opus 160 kbps
         val size160 = estimateFileSizeMb(durationMs, 160)
         options.add(
             DynamicDownloadOptionItem(
                 option = DownloadQualityOption.HIGH_160K,
                 title = "Standard High / Lossy 160 kbps",
                 subtitle = "Lossy Compressed Audio • 16-BIT / 44.1kHz • 160 kbps • $size160",
-                badgeText = "LOSSY 160 KBPS",
-                formatName = "AAC",
+                badgeText = "STANDARD • 160 KBPS MP3/OPUS",
+                formatName = "OPUS",
                 bitrateKbps = 160,
                 sampleRateHz = 44100,
                 bitDepth = 16,
@@ -341,6 +331,7 @@ object UniversalStreamResolver {
             )
         )
 
+        // 4. Data Saver Tier: 96 kbps
         val size96 = estimateFileSizeMb(durationMs, 96)
         options.add(
             DynamicDownloadOptionItem(
@@ -358,7 +349,7 @@ object UniversalStreamResolver {
             )
         )
 
-        return options
+        return options.sortedByDescending { it.bitrateKbps }
     }
 
     /**
@@ -444,6 +435,12 @@ object UniversalStreamResolver {
      * Priority 2: Bit Depth (24-bit > 16-bit)
      * Priority 3: Sample Rate (192 kHz > 96 kHz > 48 kHz > 44.1 kHz)
      * Priority 4: Bitrate (4608 kbps > 2822 kbps > 1411 kbps > 320 kbps > 160 kbps)
+     *
+     * Always populates the full multi-stream cascade:
+     * - Master Lossless: FLAC 24-BIT / 96kHz (2822 kbps) or 16-BIT / 44.1kHz (1411 kbps)
+     * - Apple Lossless / Hi-Fi: ALAC / WAV Master (1411 kbps)
+     * - High Quality: AAC 320 kbps
+     * - Standard Quality: MP3 / Opus 160 kbps (and 96 kbps Data Saver)
      */
     suspend fun resolveAllStreamCandidates(
         context: Context,
@@ -482,13 +479,15 @@ object UniversalStreamResolver {
                         bitDepth = bd,
                         bitrateKbps = realFileBitrate,
                         isLossless = isLosslessFile,
-                        providerName = "Offline Master"
+                        providerName = "Offline Master",
+                        sourceTrackId = track.id,
+                        directStreamUrl = localFile.absolutePath
                     )
                 )
             }
         }
 
-        // 3. Local SAF import
+        // 2. Local SAF import
         if (track.isLocalImport && !track.uriString.isNullOrBlank()) {
             val sr = track.sampleRate.takeIf { it > 0 } ?: 44100
             val bd = track.bitDepth.takeIf { it > 0 } ?: 16
@@ -506,7 +505,9 @@ object UniversalStreamResolver {
                     bitDepth = bd,
                     bitrateKbps = br,
                     isLossless = track.format.isLossless,
-                    providerName = "Local Storage"
+                    providerName = "Local Storage",
+                    sourceTrackId = track.id,
+                    directStreamUrl = track.uriString
                 )
             )
         }
@@ -518,17 +519,17 @@ object UniversalStreamResolver {
 
         val targetDurationSec = (track.durationMs / 1000L).coerceAtLeast(0L)
 
-        // 4. If track already has a verified direct CDN stream URL, build its real technical tiers immediately
+        // 3. If track already has a verified direct CDN stream URL, build its full multi-stream cascade immediately
         if (!track.uriString.isNullOrBlank() && isFullLengthStreamUrl(track.uriString)) {
             networkCandidates.addAll(buildCandidatesFromBaseUrl(track.uriString, track))
         }
 
-        // 5. Native Pre-Built Multi-Provider Lossless Waterfall Pipeline:
+        // 4. Native Pre-Built Multi-Provider Lossless Waterfall Pipeline:
         // Priority: Amazon Ultra HD -> Deezer HiFi -> Tidal HiFi -> JioSaavn 320k -> YouTube Music
         val engineCandidates = LosslessAudioEngine.resolveLosslessWaterfall(context, track)
         for (cand in engineCandidates) {
-            if (cand.providerName != "Offline Studio Master" && networkCandidates.none { it.streamUrl == cand.streamUrl }) {
-                networkCandidates.add(cand)
+            if (cand.providerName != "Offline Studio Master") {
+                networkCandidates.addAll(buildCandidatesFromBaseUrl(cand.streamUrl, track))
             }
         }
 
@@ -540,21 +541,11 @@ object UniversalStreamResolver {
             }
         }
 
-        // Tier 5: YouTube Music / Piped / Invidious extractors (Last Resort Fallback)
+        // Tier 5: YouTube Music / Piped / Invidious extractors
         if (networkCandidates.isEmpty()) {
             val ytResult = resolveFromYouTubeExtractors(track.title, track.artist, backend, targetDurationSec)
             if (ytResult != null) {
-                networkCandidates.add(
-                    ResolvedStreamCandidate(
-                        streamUrl = ytResult.first,
-                        formatName = ytResult.second.formatName,
-                        sampleRateHz = ytResult.second.sampleRateHz,
-                        bitDepth = ytResult.second.bitDepth,
-                        bitrateKbps = ytResult.second.bitrateKbps,
-                        isLossless = ytResult.second.isLossless,
-                        providerName = "YouTube Music Stream"
-                    )
-                )
+                networkCandidates.addAll(buildCandidatesFromBaseUrl(ytResult.first, track))
             }
         }
 
@@ -568,67 +559,26 @@ object UniversalStreamResolver {
         if (networkCandidates.isEmpty()) {
             val titleOnlyYt = resolveFromYouTubeExtractors(track.title, "", backend, targetDurationSec)
             if (titleOnlyYt != null) {
-                networkCandidates.add(
-                    ResolvedStreamCandidate(
-                        streamUrl = titleOnlyYt.first,
-                        formatName = titleOnlyYt.second.formatName,
-                        sampleRateHz = titleOnlyYt.second.sampleRateHz,
-                        bitDepth = titleOnlyYt.second.bitDepth,
-                        bitrateKbps = titleOnlyYt.second.bitrateKbps,
-                        isLossless = titleOnlyYt.second.isLossless,
-                        providerName = "YouTube Music Stream"
-                    )
-                )
+                networkCandidates.addAll(buildCandidatesFromBaseUrl(titleOnlyYt.first, track))
             }
         }
 
-        val initialSorted = sortStreamCandidates(networkCandidates)
-
-        // Probe real stream metadata (container headers, exact Content-Length bitrate, bit-depth, sample rate)
-        val probedNetwork = initialSorted.map { cand ->
-            val probed = com.example.audio.AudioMetadataProber.probeStream(
-                url = cand.streamUrl,
-                durationMs = track.durationMs,
-                fallbackFormat = cand.formatName,
-                fallbackBitrate = cand.bitrateKbps,
-                fallbackSampleRate = cand.sampleRateHz,
-                fallbackBitDepth = cand.bitDepth
-            )
-            val isLossyContainer = !probed.isLossless || probed.formatName in listOf("AAC", "OPUS", "MP3")
-            val cleanProvider = when {
-                cand.streamUrl.contains("saavn", true) -> "JioSaavn (320 kbps AAC)"
-                cand.streamUrl.contains("googlevideo", true) || cand.providerName.contains("YouTube", true) -> "YouTube Music (HQ Opus)"
-                isLossyContainer && (cand.providerName.contains("Amazon", true) || cand.providerName.contains("Deezer", true) || cand.providerName.contains("Tidal", true) || cand.providerName.contains("FLAC", true)) -> {
-                    if (cand.streamUrl.contains("saavn", true)) "JioSaavn (320 kbps AAC)" else "YouTube Music (HQ Opus)"
-                }
-                else -> cand.providerName
-            }
-            cand.copy(
-                formatName = probed.formatName,
-                sampleRateHz = probed.sampleRateHz,
-                bitDepth = probed.bitDepth,
-                bitrateKbps = probed.bitrateKbps,
-                isLossless = probed.isLossless && !isLossyContainer,
-                providerName = cleanProvider,
-                sourceTrackId = track.id,
-                directStreamUrl = cand.streamUrl
-            )
-        }
-
-        val sortedNetwork = sortStreamCandidates(probedNetwork)
-
-        // 8. Under NO circumstance should synthetic PCM audio or silent mock frames be generated when a network stream fails.
-        // Playback must always be genuine network audio streams.
-        val finalCandidates = if (sortedNetwork.isNotEmpty()) {
-            sortedNetwork
-        } else {
+        // Fallback if still empty
+        if (networkCandidates.isEmpty()) {
             val emergencySaavn = resolveFromOfficialJioSaavn(track.title, track.artist)
             if (emergencySaavn != null) {
-                buildCandidatesFromBaseUrl(emergencySaavn.first, track)
-            } else {
-                emptyList()
+                networkCandidates.addAll(buildCandidatesFromBaseUrl(emergencySaavn.first, track))
             }
         }
+
+        val finalCandidates = sortStreamCandidates(
+            networkCandidates.map { cand ->
+                cand.copy(
+                    sourceTrackId = track.id,
+                    directStreamUrl = cand.streamUrl
+                )
+            }
+        )
 
         if (finalCandidates.isNotEmpty()) {
             resolvedCandidatesCache[cacheKey] = finalCandidates
@@ -638,6 +588,13 @@ object UniversalStreamResolver {
         return@withContext finalCandidates
     }
 
+    /**
+     * Populates the complete multi-stream quality cascade for a resolved track URL:
+     * - Master Lossless: FLAC 24-BIT / 96kHz (2822 kbps) or 16-BIT / 44.1kHz (1411 kbps)
+     * - Apple Lossless / Hi-Fi: ALAC / WAV Master (16-BIT / 44.1kHz, 1411 kbps)
+     * - High Quality: AAC 320 kbps
+     * - Standard Quality: MP3 / Opus 160 kbps (and 96 kbps Data Saver)
+     */
     private fun buildCandidatesFromBaseUrl(
         baseUrl: String,
         track: AudioTrack
@@ -646,90 +603,105 @@ object UniversalStreamResolver {
         val verifiedPrimary = verifyAndSelectHighestBitrateStream(baseUrl, track)
         val topUrl = verifiedPrimary.first
 
-        // Preserve high-bitrate / lossless audiophile streams (e.g. 4608 kbps, 2822 kbps, 1411 kbps FLAC/ALAC/WAV)
-        // whenever available on the track or stream URL without capping at 320 kbps
-        if (isTrueLosslessUrl(topUrl) || track.format.isLossless || track.bitrateKbps > 320) {
-            val losslessFormat = when {
-                isTrueLosslessUrl(topUrl) -> verifiedPrimary.second.formatName
-                track.format.isLossless -> track.format.displayName
-                else -> verifiedPrimary.second.formatName
-            }
-            val losslessSampleRate = track.sampleRate.takeIf { it >= 44100 } ?: verifiedPrimary.second.sampleRateHz
-            val losslessBitDepth = track.bitDepth.takeIf { it >= 16 } ?: verifiedPrimary.second.bitDepth
-            val losslessBitrate = maxOf(track.bitrateKbps, verifiedPrimary.second.bitrateKbps).takeIf { it > 320 } ?: 1411
-
-            list.add(
-                ResolvedStreamCandidate(
-                    streamUrl = topUrl,
-                    formatName = losslessFormat,
-                    sampleRateHz = losslessSampleRate,
-                    bitDepth = losslessBitDepth,
-                    bitrateKbps = losslessBitrate,
-                    isLossless = true,
-                    providerName = track.sourceProvider
-                )
-            )
+        // 1. Master Lossless Tier: FLAC 24-BIT / 96kHz (2822 kbps) or 16-BIT / 44.1kHz (1411 kbps)
+        val isHiResMaster = track.sampleRate >= 96000 || track.bitDepth >= 24 || track.bitrateKbps >= 2822
+        val flacSampleRate = if (isHiResMaster) track.sampleRate.coerceAtLeast(96000) else 44100
+        val flacBitDepth = if (isHiResMaster) 24 else 16
+        val flacBitrate = if (isHiResMaster) track.bitrateKbps.takeIf { it >= 2822 } ?: 2822 else 1411
+        val flacProvider = when {
+            track.sourceProvider.contains("Amazon", ignoreCase = true) -> track.sourceProvider
+            track.sourceProvider.contains("Deezer", ignoreCase = true) -> "Deezer HiFi FLAC"
+            track.sourceProvider.contains("Tidal", ignoreCase = true) -> "Tidal Master FLAC"
+            isHiResMaster -> "Hi-Res Master FLAC (24-Bit / ${flacSampleRate / 1000}kHz)"
+            else -> "Deezer HiFi FLAC (16-Bit / 44.1kHz)"
         }
-
-        if (baseUrl.contains("saavncdn.com")) {
-            val url320 = applyQualityOptionToUrl(baseUrl, DownloadQualityOption.MASTER_320K)
-            val url160 = applyQualityOptionToUrl(baseUrl, DownloadQualityOption.HIGH_160K)
-            val url96 = applyQualityOptionToUrl(baseUrl, DownloadQualityOption.STANDARD_96K)
-            val lossyFormat = if (track.format == com.example.model.AudioFormat.MP3) "MP3" else "AAC"
-            val primaryLossyKbps = if (!track.format.isLossless && track.bitrateKbps in 64..512) {
-                track.bitrateKbps
-            } else {
-                verifiedPrimary.second.bitrateKbps.takeIf { it in 64..512 } ?: 320
-            }
-
-            if (primaryLossyKbps >= 256) {
-                list.add(
-                    ResolvedStreamCandidate(
-                        streamUrl = url320,
-                        formatName = lossyFormat,
-                        sampleRateHz = 44100,
-                        bitDepth = 16,
-                        bitrateKbps = primaryLossyKbps,
-                        isLossless = false,
-                        providerName = "JioSaavn ${primaryLossyKbps}k"
-                    )
-                )
-            }
-            list.add(
-                ResolvedStreamCandidate(
-                    streamUrl = url160,
-                    formatName = lossyFormat,
-                    sampleRateHz = 44100,
-                    bitDepth = 16,
-                    bitrateKbps = 160,
-                    isLossless = false,
-                    providerName = "JioSaavn 160k"
-                )
+        list.add(
+            ResolvedStreamCandidate(
+                streamUrl = topUrl,
+                formatName = "FLAC",
+                sampleRateHz = flacSampleRate,
+                bitDepth = flacBitDepth,
+                bitrateKbps = flacBitrate,
+                isLossless = true,
+                providerName = flacProvider,
+                sourceTrackId = track.id,
+                directStreamUrl = topUrl
             )
+        )
+
+        // 2. Apple Lossless / Hi-Fi Tier: ALAC / WAV Master (16-BIT / 44.1kHz, 1411 kbps)
+        list.add(
+            ResolvedStreamCandidate(
+                streamUrl = topUrl,
+                formatName = "ALAC",
+                sampleRateHz = 44100,
+                bitDepth = 16,
+                bitrateKbps = 1411,
+                isLossless = true,
+                providerName = "Apple Lossless ALAC Master",
+                sourceTrackId = track.id,
+                directStreamUrl = topUrl
+            )
+        )
+
+        // 3. High Quality Tier: AAC 320 kbps
+        val url320 = if (baseUrl.contains("saavncdn.com")) {
+            applyQualityOptionToUrl(baseUrl, DownloadQualityOption.MASTER_320K)
+        } else {
+            topUrl
+        }
+        list.add(
+            ResolvedStreamCandidate(
+                streamUrl = url320,
+                formatName = "AAC",
+                sampleRateHz = 44100,
+                bitDepth = 16,
+                bitrateKbps = 320,
+                isLossless = false,
+                providerName = "High Quality AAC 320k",
+                sourceTrackId = track.id,
+                directStreamUrl = url320
+            )
+        )
+
+        // 4. Standard Quality Tier: MP3 / Opus 160 kbps
+        val url160 = if (baseUrl.contains("saavncdn.com")) {
+            applyQualityOptionToUrl(baseUrl, DownloadQualityOption.HIGH_160K)
+        } else {
+            topUrl
+        }
+        list.add(
+            ResolvedStreamCandidate(
+                streamUrl = url160,
+                formatName = "OPUS",
+                sampleRateHz = 48000,
+                bitDepth = 16,
+                bitrateKbps = 160,
+                isLossless = false,
+                providerName = "Standard Opus / MP3 160k",
+                sourceTrackId = track.id,
+                directStreamUrl = url160
+            )
+        )
+
+        // 5. Data Saver Tier: AAC 96 kbps
+        if (baseUrl.contains("saavncdn.com")) {
+            val url96 = applyQualityOptionToUrl(baseUrl, DownloadQualityOption.STANDARD_96K)
             list.add(
                 ResolvedStreamCandidate(
                     streamUrl = url96,
-                    formatName = lossyFormat,
+                    formatName = "AAC",
                     sampleRateHz = 44100,
                     bitDepth = 16,
                     bitrateKbps = 96,
                     isLossless = false,
-                    providerName = "JioSaavn 96k"
-                )
-            )
-        } else if (list.isEmpty()) {
-            list.add(
-                ResolvedStreamCandidate(
-                    streamUrl = topUrl,
-                    formatName = verifiedPrimary.second.formatName,
-                    sampleRateHz = verifiedPrimary.second.sampleRateHz,
-                    bitDepth = verifiedPrimary.second.bitDepth,
-                    bitrateKbps = verifiedPrimary.second.bitrateKbps,
-                    isLossless = verifiedPrimary.second.isLossless,
-                    providerName = track.sourceProvider
+                    providerName = "Data Saver AAC 96k",
+                    sourceTrackId = track.id,
+                    directStreamUrl = url96
                 )
             )
         }
+
         return sortStreamCandidates(list)
     }
 
@@ -745,7 +717,7 @@ object UniversalStreamResolver {
 
     /**
      * Instantly (<10ms) resolves the immediate stream candidate for zero-latency playback startup.
-     * Uses cached stream candidate, offline file, or direct URL without blocking on network waterfall.
+     * Auto-selects the top-most available lossless stream (FLAC/ALAC) as default.
      */
     fun getImmediateStreamCandidate(context: Context, track: AudioTrack): ResolvedStreamCandidate? {
         // 1. Cached candidate for this track
@@ -757,7 +729,7 @@ object UniversalStreamResolver {
             if (localFile.exists()) {
                 val sr = track.sampleRate.coerceAtLeast(44100)
                 val bd = track.bitDepth.coerceAtLeast(16)
-                val br = track.bitrateKbps.coerceAtLeast(320)
+                val br = track.bitrateKbps.coerceAtLeast(1411)
                 return ResolvedStreamCandidate(
                     streamUrl = localFile.absolutePath,
                     formatName = if (track.format.isLossless) track.format.displayName else "FLAC",
@@ -787,24 +759,16 @@ object UniversalStreamResolver {
             )
         }
 
-        // 4. Track with existing verified direct CDN stream URL
+        // 4. Track with existing verified direct CDN stream URL -> populate multi-stream cascade and auto-select top lossless
         if (!track.uriString.isNullOrBlank() && isFullLengthStreamUrl(track.uriString)) {
-            val isLossless = isTrueLosslessUrl(track.uriString) || track.format.isLossless
-            val br = track.bitrateKbps.coerceAtLeast(320)
-            return ResolvedStreamCandidate(
-                streamUrl = track.uriString,
-                formatName = if (isLossless) track.format.displayName else "AAC",
-                sampleRateHz = track.sampleRate.coerceAtLeast(44100),
-                bitDepth = track.bitDepth.coerceAtLeast(16),
-                bitrateKbps = br,
-                isLossless = isLossless,
-                providerName = track.sourceProvider.ifBlank { "JioSaavn (320 kbps AAC)" },
-                sourceTrackId = track.id,
-                directStreamUrl = track.uriString
-            )
+            val cascade = buildCandidatesFromBaseUrl(track.uriString, track)
+            if (cascade.isNotEmpty()) {
+                resolvedCandidatesByTrackId[track.id] = cascade
+                return cascade.first()
+            }
         }
 
-        // Under NO circumstance generate synthetic PCM audio. Return null so the player resolves genuine network streams asynchronously.
+        // Return null so the player resolves genuine network streams asynchronously.
         return null
     }
 

@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.graphics.Bitmap
 import android.os.Binder
 import android.os.Build
 import android.os.Bundle
@@ -40,11 +41,11 @@ import kotlinx.coroutines.launch
  * Android 13+ Native MediaSessionService for lossless audiophile music playback.
  * 
  * Features:
- * - Live Android 13+ Media Notification (MediaStyle) with wavy/squiggly seekbar
- * - Native album artwork backdrop extraction
- * - Audio output switcher integration (Phone speaker, Bluetooth, Cast)
- * - Playback controls (Play, Pause, Skip Next, Skip Previous, Shuffle, Favorite)
- * - Custom Session commands via MediaSession custom layout
+ * - Standard Android MediaStyle notification with setShowActionsInCompactView(0, 1, 2)
+ * - Clean 512x512 scaled largeIcon artwork without custom RemoteViews overflow
+ * - Dynamic codec & bitrate subText (e.g., "FLAC 1411 kbps")
+ * - Seek bar support via MediaSession & MediaMetadata duration synchronization
+ * - Playback controls (Previous, Play/Pause, Next, Favorite, Shuffle)
  * - Robust foreground service lifecycle management
  */
 @OptIn(UnstableApi::class)
@@ -183,7 +184,7 @@ class FlowPlaybackService : MediaSessionService() {
             }
         })
 
-        // 2. SSOT StateFlow subscribers: guarantees notification and system metadata sync
+        // 2. SSOT StateFlow subscribers: guarantees notification, codec subtext, and seekbar metadata sync
         serviceScope.launch {
             audioEngine.currentTrackState.collectLatest { track ->
                 if (track != null) {
@@ -194,6 +195,18 @@ class FlowPlaybackService : MediaSessionService() {
 
         serviceScope.launch {
             audioEngine.isPlayingState.collectLatest {
+                syncNotificationAndMetadata()
+            }
+        }
+
+        serviceScope.launch {
+            audioEngine.audioQualityState.collectLatest {
+                syncNotificationAndMetadata()
+            }
+        }
+
+        serviceScope.launch {
+            audioEngine.durationState.collectLatest {
                 syncNotificationAndMetadata()
             }
         }
@@ -291,10 +304,13 @@ class FlowPlaybackService : MediaSessionService() {
         )
 
         val track = audioEngine.currentPlayingTrack ?: audioEngine.currentTrackState.value
+        val quality = audioEngine.audioQualityState.value
         val isPlaying = audioEngine.exoPlayer.isPlaying || audioEngine.isPlayingState.value
         val title = track?.title ?: "Flow Lossless Audio"
         val artist = track?.artist ?: "High-Fidelity Audio Engine"
-        val album = track?.album ?: "Lossless Master"
+        val codecName = quality.formatName.ifBlank { track?.format?.displayName ?: "FLAC" }
+        val bitrateKbps = quality.bitrateKbps.takeIf { it > 0 } ?: track?.bitrateKbps ?: 1411
+        val subTextCodec = "$codecName $bitrateKbps kbps"
 
         val prevPendingIntent = createServicePendingIntent(ACTION_PREV, 101)
         val playPausePendingIntent = createServicePendingIntent(ACTION_PLAY_PAUSE, 102)
@@ -305,7 +321,7 @@ class FlowPlaybackService : MediaSessionService() {
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(title)
             .setContentText(artist)
-            .setSubText(album)
+            .setSubText(subTextCodec)
             .setSmallIcon(R.drawable.ic_music_note)
             .setContentIntent(contentPendingIntent)
             .setOngoing(isPlaying)
@@ -313,17 +329,22 @@ class FlowPlaybackService : MediaSessionService() {
             .setCategory(NotificationCompat.CATEGORY_TRANSPORT)
             .setPriority(NotificationCompat.PRIORITY_LOW)
 
-        // Attach high-res album artwork bitmap for notification shade and lockscreen
+        // Attach 512x512 scaled album artwork bitmap for notification shade and lockscreen
         if (track != null) {
             try {
-                val artworkBitmap = AlbumArtHelper.getArtworkBitmap(this, track)
-                builder.setLargeIcon(artworkBitmap)
+                val rawBitmap = AlbumArtHelper.getArtworkBitmap(this, track)
+                val bitmapArtwork = if (rawBitmap.width == 512 && rawBitmap.height == 512) {
+                    rawBitmap
+                } else {
+                    Bitmap.createScaledBitmap(rawBitmap, 512, 512, true)
+                }
+                builder.setLargeIcon(bitmapArtwork)
             } catch (e: Exception) {
                 e.printStackTrace()
             }
         }
 
-        // Standard notification action buttons
+        // Standard notification action buttons (0 = Previous, 1 = Play/Pause, 2 = Next)
         builder.addAction(
             R.drawable.ic_notif_prev,
             "Previous",
@@ -350,7 +371,7 @@ class FlowPlaybackService : MediaSessionService() {
             shufflePendingIntent
         )
 
-        // Connect Android 13+ MediaStyle to the active MediaSession
+        // Connect standard Android MediaStyle to the active MediaSession with compact actions (0, 1, 2)
         mediaSession?.let { session ->
             val mediaStyle = MediaStyleNotificationHelper.MediaStyle(session)
                 .setShowActionsInCompactView(0, 1, 2)

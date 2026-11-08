@@ -19,14 +19,15 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.AudioFile
+import androidx.compose.material.icons.filled.CloudDownload
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Favorite
+import androidx.compose.material.icons.filled.FavoriteBorder
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.MusicNote
@@ -40,14 +41,8 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material.icons.filled.CheckCircle
-import androidx.compose.material.icons.filled.CloudDownload
-import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.FavoriteBorder
-import androidx.compose.ui.layout.ContentScale
-import coil.compose.AsyncImage
+import androidx.compose.material3.ScrollableTabRow
 import androidx.compose.material3.Tab
-import androidx.compose.material3.TabRow
 import androidx.compose.material3.TabRowDefaults
 import androidx.compose.material3.TabRowDefaults.tabIndicatorOffset
 import androidx.compose.material3.Text
@@ -61,19 +56,19 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import coil.compose.AsyncImage
 import com.example.model.AudioTrack
 import com.example.model.Playlist
 import com.example.ui.theme.CyberCyan
 import com.example.ui.theme.DeezerPinkAccent
 import com.example.ui.theme.DeezerPurplePrimary
-import com.example.ui.theme.HiResGold
 import com.example.ui.theme.SuccessGreen
-import com.example.ui.theme.SurfaceDarkCard
 import com.example.ui.theme.SurfaceDarkElevated
 import com.example.ui.theme.TextPrimaryDark
 import com.example.ui.theme.TextSecondaryDark
@@ -174,19 +169,23 @@ fun LibraryScreen(
 
         Spacer(modifier = Modifier.height(14.dp))
 
-        // Tab Navigation
-        TabRow(
+        // Scrollable Tab Navigation — prevents mid-word wrapping like "Downloa\nded"
+        ScrollableTabRow(
             selectedTabIndex = selectedTab,
+            edgePadding = 16.dp,
             containerColor = Color.Transparent,
             contentColor = DeezerPinkAccent,
+            divider = {},
             indicator = { tabPositions ->
-                TabRowDefaults.Indicator(
-                    modifier = Modifier.tabIndicatorOffset(tabPositions[selectedTab]),
-                    color = DeezerPinkAccent,
-                    height = 2.5.dp
-                )
+                if (selectedTab in tabPositions.indices) {
+                    TabRowDefaults.Indicator(
+                        modifier = Modifier.tabIndicatorOffset(tabPositions[selectedTab]),
+                        color = DeezerPinkAccent,
+                        height = 2.5.dp
+                    )
+                }
             },
-            modifier = Modifier.padding(horizontal = 20.dp)
+            modifier = Modifier.fillMaxWidth()
         ) {
             tabs.forEachIndexed { index, title ->
                 Tab(
@@ -197,7 +196,10 @@ fun LibraryScreen(
                             text = title,
                             fontSize = 13.sp,
                             fontWeight = if (selectedTab == index) FontWeight.Bold else FontWeight.Medium,
-                            color = if (selectedTab == index) TextPrimaryDark else TextSecondaryDark
+                            color = if (selectedTab == index) TextPrimaryDark else TextSecondaryDark,
+                            maxLines = 1,
+                            softWrap = false,
+                            overflow = TextOverflow.Visible
                         )
                     }
                 )

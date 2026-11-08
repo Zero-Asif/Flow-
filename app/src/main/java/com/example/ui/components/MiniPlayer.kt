@@ -1,11 +1,11 @@
 package com.example.ui.components
 
+import androidx.compose.ui.platform.LocalContext
 import coil.compose.AsyncImage
+import coil.request.ImageRequest
 import androidx.compose.ui.layout.ContentScale
+import com.example.util.AlbumArtHelper
 
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.slideInVertically
-import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
@@ -25,6 +25,7 @@ import androidx.compose.material.icons.filled.FavoriteBorder
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.SkipNext
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -61,6 +62,7 @@ fun MiniPlayer(
     onNext: () -> Unit,
     onToggleFavorite: (String) -> Unit,
     onExpand: () -> Unit,
+    isBuffering: Boolean = false,
     modifier: Modifier = Modifier
 ) {
     if (currentTrack == null) return
@@ -77,15 +79,25 @@ fun MiniPlayer(
         shape = RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp)
     ) {
         Column {
-            // Thin progress bar along top edge
-            LinearProgressIndicator(
-                progress = { progress },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(2.5.dp),
-                color = DeezerPinkAccent,
-                trackColor = SurfaceDarkCard
-            )
+            // Thin progress / buffering bar along top edge
+            if (isBuffering && !isPlaying) {
+                LinearProgressIndicator(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(2.5.dp),
+                    color = DeezerPinkAccent,
+                    trackColor = SurfaceDarkCard
+                )
+            } else {
+                LinearProgressIndicator(
+                    progress = { progress },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(2.5.dp),
+                    color = DeezerPinkAccent,
+                    trackColor = SurfaceDarkCard
+                )
+            }
 
             Row(
                 modifier = Modifier
@@ -96,8 +108,14 @@ fun MiniPlayer(
                 // Album Art Thumbnail
                 val gradColors = currentTrack.gradientColors.map { Color(it) }
                 if (!currentTrack.artworkUrl.isNullOrBlank()) {
+                    val context = LocalContext.current
                     AsyncImage(
-                        model = currentTrack.artworkUrl,
+                        model = ImageRequest.Builder(context)
+                            .data(AlbumArtHelper.enhanceArtworkUrl(currentTrack.artworkUrl))
+                            .memoryCacheKey(currentTrack.id)
+                            .diskCacheKey(currentTrack.id)
+                            .crossfade(true)
+                            .build(),
                         contentDescription = currentTrack.title,
                         contentScale = ContentScale.Crop,
                         modifier = Modifier
@@ -159,7 +177,11 @@ fun MiniPlayer(
                     }
 
                     Text(
-                        text = "${currentTrack.artist} • ${currentTrack.format.displayName} • ${currentTrack.bitrateKbps} kbps",
+                        text = if (isBuffering && !isPlaying) {
+                            "${currentTrack.artist} • Buffering stream..."
+                        } else {
+                            "${currentTrack.artist} • ${currentTrack.format.displayName} • ${currentTrack.bitrateKbps} kbps"
+                        },
                         style = MaterialTheme.typography.bodySmall.copy(
                             color = TextSecondaryDark,
                             fontSize = 12.sp
@@ -182,7 +204,7 @@ fun MiniPlayer(
                     )
                 }
 
-                // Play / Pause button
+                // Play / Pause / Buffering button
                 IconButton(
                     onClick = onTogglePlay,
                     modifier = Modifier
@@ -191,12 +213,20 @@ fun MiniPlayer(
                         .background(DeezerPurplePrimary)
                         .testTag("mini_player_play_pause")
                 ) {
-                    Icon(
-                        imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
-                        contentDescription = if (isPlaying) "Pause" else "Play",
-                        tint = Color.White,
-                        modifier = Modifier.size(24.dp)
-                    )
+                    if (isBuffering && !isPlaying) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(20.dp),
+                            color = Color.White,
+                            strokeWidth = 2.2.dp
+                        )
+                    } else {
+                        Icon(
+                            imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                            contentDescription = if (isPlaying) "Pause" else "Play",
+                            tint = Color.White,
+                            modifier = Modifier.size(24.dp)
+                        )
+                    }
                 }
 
                 Spacer(modifier = Modifier.width(4.dp))

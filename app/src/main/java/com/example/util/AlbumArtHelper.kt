@@ -2,6 +2,7 @@ package com.example.util
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.LinearGradient
@@ -10,22 +11,34 @@ import android.graphics.RectF
 import android.graphics.Shader
 import android.net.Uri
 import com.example.model.AudioTrack
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
 
 /**
- * Utility to generate and cache high-resolution album artwork for tracks.
- * Provides Bitmaps, ByteArrays (for MediaMetadata.artworkData), and file Uris (for MediaMetadata.artworkUri).
- * This enables the Android 13+ System UI to render full-bleed album artwork in the Live Media Notification.
+ * Utility to fetch, scale, and cache high-resolution 512x512 album artwork for tracks.
+ * Provides Bitmaps, ByteArrays (for MediaMetadata.artworkData and container embedding),
+ * and file Uris (for MediaMetadata.artworkUri).
  */
 object AlbumArtHelper {
 
     private const val ARTWORK_SIZE = 512
-    private val enhancedUrlCache = java.util.concurrent.ConcurrentHashMap<String, String>()
+    private val enhancedUrlCache = ConcurrentHashMap<String, String>()
+    private val memoryBitmapCache = ConcurrentHashMap<String, Bitmap>()
+
+    private val artHttpClient = OkHttpClient.Builder()
+        .connectTimeout(5, TimeUnit.SECONDS)
+        .readTimeout(5, TimeUnit.SECONDS)
+        .followRedirects(true)
+        .followSslRedirects(true)
+        .build()
 
     /**
-     * Module 4: Dynamic High-Resolution Cover Art URL Enhancer:
+     * Dynamic High-Resolution Cover Art URL Enhancer:
      * - Deezer: Replaces /56x56-, /100x100-, /250x250-, or /500x500- with /1000x1000-000000-80-0-0.jpg
      * - Amazon Music / Apple: Strips downscaled sizing parameters (._SX300_, ._AC_UL320_) -> ._UL1500_ and 1000x1000bb
      * - YouTube Music: Replaces =w60-h60 / =w120-h120 with =w1080-h1080-l95-rj or maxresdefault.jpg
@@ -91,10 +104,108 @@ object AlbumArtHelper {
         return upgraded
     }
 
+    fun getCachedBitmap(trackId: String): Bitmap? {
+        return memoryBitmapCache[trackId]?.takeIf { !it.isRecycled }
+    }
+
+    fun cacheBitmap(trackId: String, bitmap: Bitmap) {
+        if (!bitmap.isRecycled) {
+            memoryBitmapCache[trackId] = bitmap
+        }
+    }
+
+    /**
+     * Fetches the real album artwork from `track.artworkUrl` (local file or remote HTTP/HTTPS)
+     * and scales it to 512x512 ARGB_8888, falling back to the generated vinyl cover if offline.
+     */
+    fun fetchOrGenerateArtworkBitmap(context: Context, track: AudioTrack): Bitmap {
+        memoryBitmapCache[track.id]?.takeIf { !it.isRecycled }?.let { return it }
+
+        val cacheDir = File(context.cacheDir, "album_art_real")
+        if (!cacheDir.exists()) cacheDir.mkdirs()
+        val cachedRealFile = File(cacheDir, "${track.id.replace(Regex("[^a-zA-Z0-9._-]"), "_")}.jpg")
+
+        if (cachedRealFile.exists() && cachedRealFile.length() > 1024L) {
+            runCatching {
+                val decoded = BitmapFactory.decodeFile(cachedRealFile.absolutePath)
+                if (decoded != null) {
+                    val scaled = scaleTo512(decoded)
+                    memoryBitmapCache[track.id] = scaled
+                    return scaled
+                }
+            }
+        }
+
+        val rawArt = track.artworkUrl?.trim().orEmpty()
+        if (rawArt.isNotBlank()) {
+            // Check local file path first
+            if (rawArt.startsWith("/") || rawArt.startsWith("file://")) {
+                val f = File(rawArt.removePrefix("file://"))
+                if (f.exists() && f.length() > 512L) {
+                    runCatching {
+                        val decoded = BitmapFactory.decodeFile(f.absolutePath)
+                        if (decoded != null) {
+                            val scaled = scaleTo512(decoded)
+                            memoryBitmapCache[track.id] = scaled
+                            return scaled
+                        }
+                    }
+                }
+            } else if (rawArt.startsWith("http://") || rawArt.startsWith("https://")) {
+                val candidateUrls = listOf(enhanceArtworkUrl(rawArt), rawArt).distinct()
+                for (url in candidateUrls) {
+                    try {
+                        val req = Request.Builder()
+                            .url(url)
+                            .header("User-Agent", "Mozilla/5.0 (Linux; Android 14; Mobile) FlowAudio/2.0")
+                            .build()
+                        artHttpClient.newCall(req).execute().use { resp ->
+                            if (resp.isSuccessful) {
+                                val bytes = resp.body?.bytes()
+                                if (bytes != null && bytes.size > 512) {
+                                    val decoded = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                                    if (decoded != null) {
+                                        val scaled = scaleTo512(decoded)
+                                        runCatching {
+                                            FileOutputStream(cachedRealFile).use { fos ->
+                                                scaled.compress(Bitmap.CompressFormat.JPEG, 92, fos)
+                                            }
+                                        }
+                                        memoryBitmapCache[track.id] = scaled
+                                        return scaled
+                                    }
+                                }
+                            }
+                        }
+                    } catch (_: Exception) {
+                        // Try unenhanced URL or fallback
+                    }
+                }
+            }
+        }
+
+        return getArtworkBitmap(context, track)
+    }
+
+    fun scaleTo512(source: Bitmap): Bitmap {
+        val soft = if (source.config == Bitmap.Config.HARDWARE) {
+            source.copy(Bitmap.Config.ARGB_8888, false)
+        } else {
+            source
+        }
+        return if (soft.width == ARTWORK_SIZE && soft.height == ARTWORK_SIZE) {
+            soft
+        } else {
+            Bitmap.createScaledBitmap(soft, ARTWORK_SIZE, ARTWORK_SIZE, true)
+        }
+    }
+
     fun getArtworkBitmap(context: Context, track: AudioTrack): Bitmap {
+        memoryBitmapCache[track.id]?.takeIf { !it.isRecycled }?.let { return it }
+
         val cacheDir = File(context.cacheDir, "album_art")
         if (!cacheDir.exists()) cacheDir.mkdirs()
-        val artFile = File(cacheDir, "${track.id}.jpg")
+        val artFile = File(cacheDir, "${track.id.replace(Regex("[^a-zA-Z0-9._-]"), "_")}.jpg")
 
         val bitmap = Bitmap.createBitmap(ARTWORK_SIZE, ARTWORK_SIZE, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bitmap)
@@ -186,7 +297,8 @@ object AlbumArtHelper {
 
     fun getArtworkUri(context: Context, track: AudioTrack): Uri {
         val cacheDir = File(context.cacheDir, "album_art")
-        val artFile = File(cacheDir, "${track.id}.jpg")
+        if (!cacheDir.exists()) cacheDir.mkdirs()
+        val artFile = File(cacheDir, "${track.id.replace(Regex("[^a-zA-Z0-9._-]"), "_")}.jpg")
         if (!artFile.exists()) {
             getArtworkBitmap(context, track)
         }
@@ -194,9 +306,10 @@ object AlbumArtHelper {
     }
 
     fun getArtworkByteArray(context: Context, track: AudioTrack): ByteArray {
-        val bitmap = getArtworkBitmap(context, track)
+        val bitmap = memoryBitmapCache[track.id]?.takeIf { !it.isRecycled }
+            ?: getArtworkBitmap(context, track)
         val stream = ByteArrayOutputStream()
-        bitmap.compress(Bitmap.CompressFormat.JPEG, 90, stream)
+        bitmap.compress(Bitmap.CompressFormat.JPEG, 92, stream)
         return stream.toByteArray()
     }
 }

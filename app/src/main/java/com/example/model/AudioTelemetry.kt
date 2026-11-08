@@ -1,25 +1,30 @@
 package com.example.model
 
 data class AudioQualityInfo(
-    val formatName: String = "AAC",
+    val formatName: String = "PROBING",
     val sampleRateHz: Int = 44100,
     val bitDepth: Int = 16,
-    val bitrateKbps: Int = 320,
+    val bitrateKbps: Int = 0,
     val channelCount: Int = 2,
     val isLossless: Boolean = false,
     val isHiRes: Boolean = false
 ) {
+    val qualityTierLabel: String
+        get() = when {
+            isLossless -> "BIT-PERFECT"
+            bitrateKbps >= 256 || isHiRes -> "HIGH QUALITY"
+            bitrateKbps > 0 -> "STANDARD"
+            else -> "STREAMING"
+        }
+
     fun getBadgeText(mode: BadgeDisplayMode): String = when (mode) {
         BadgeDisplayMode.AUDIOPHILE_FULL -> {
-            val bitDepthStr = if (bitDepth > 0) "${bitDepth}-BIT / " else ""
+            val codecStr = formatName.ifBlank { "AUDIO" }.uppercase()
+            val bitDepthStr = "${bitDepth.coerceAtLeast(16)}-BIT / "
             val rateStr = formatSampleRateKHz(sampleRateHz)
-            val bitRateStr = if (bitrateKbps > 0) " • ${bitrateKbps} kbps" else ""
-            val tierTag = when {
-                isLossless -> " • BIT-PERFECT"
-                bitrateKbps >= 256 || isHiRes -> " • HIGH QUALITY"
-                else -> " • STANDARD"
-            }
-            "$formatName $bitDepthStr$rateStr$bitRateStr$tierTag"
+            val bitRateStr = if (bitrateKbps > 0) " • $bitrateKbps kbps" else ""
+            val tierTag = " • $qualityTierLabel"
+            "$codecStr $bitDepthStr$rateStr$bitRateStr$tierTag"
         }
         BadgeDisplayMode.CLEAN_STREAMING -> {
             val tier = when {

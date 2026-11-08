@@ -2,73 +2,175 @@ package com.example.network
 
 import android.util.Log
 import com.example.model.AudioTrack
-import okhttp3.OkHttpClient
-import okhttp3.Request
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
 import java.net.URLEncoder
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.TimeUnit
 import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
 
 /**
- * Multi-Stage Canonical Metadata & Stream Verification Engine (Module: StreamMatcher)
+ * Canonical ISRC-first track metadata and multi-factor stream matching engine.
  *
- * Guarantees zero wrong-song mismatches by:
- * 1. Canonical Metadata Registry Lookup (iTunes Search API & MusicBrainz Open Registry)
- *    to retrieve authoritative Canonical Title, Primary Artist, Exact Duration (ms),
- *    Primary Genre, High-Res Artwork (1400x1400), and ISRC.
- * 2. Cross-Provider ISRC Matching: Matches by 12-character ISRC code (isrc:{ISRC}).
- * 3. Strict Duration Sanity Filter: Enforces ±3 second (±3000ms) duration tolerance.
- *    Discards any stream candidate whose duration differs from canonical duration by >3s.
- * 4. String Distance Normalization & Multi-Factor Identity Scoring:
- *    Strips punctuation, soundtrack tags, remaster suffixes, and requires >= 85% similarity.
+ * Implements:
+ * 1. Canonical Metadata Fetching (iTunes Search API & Deezer API) to resolve official
+ *    `ISRC`, `trackTimeMillis`, `primaryGenreName`, `collectionName`, and high-res artwork.
+ * 2. Strict Vocal-Master Verification & Anti-Instrumental/Karaoke Filter:
+ *    - Immediately discards any candidate stream or track containing `"instrumental"`, `"karaoke"`,
+ *      `"backing track"`, `"minus one"`, `"no vocal"`, `"off vocal"`, `"piano tutorial"`,
+ *      `"acoustic cover"`, `"guitar backing"`, etc., unless the user's query explicitly requests it.
+ *    - Prioritizes candidates explicitly labeled `"Official Audio"`, `"Official Music Video"`,
+ *      or `"- Topic"` (YouTube Official Auto-Generated Music Channels).
+ * 3. Weighted Confidence Matrix (`0..100+` score) for stream verification:
+ *    - ISRC Exact Match: +50 pts
+ *    - Title & Artist Levenshtein Similarity (> 0.85): +25 pts
+ *    - Duration Proximity (within ±3.0 seconds of canonical duration): +25 pts
+ *    - Minimum threshold to accept a stream: 70 pts (and hard rejection if duration differs by > 3.0s).
  */
 object StreamMatcher {
-
     private const val TAG = "StreamMatcher"
-    const val MATCH_THRESHOLD_PERCENT = 85
-    const val MAX_DURATION_DEVIATION_SEC = 3L
-    const val MAX_DURATION_DEVIATION_MS = 3000L
 
-    private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(6, TimeUnit.SECONDS)
-        .readTimeout(6, TimeUnit.SECONDS)
-        .build()
+    /** Strict ±3.0 second tolerance (3,000ms) for canonical track verification. */
+    const val STRICT_DURATION_TOLERANCE_MS = 3_000L
 
-    private val canonicalCache = ConcurrentHashMap<String, CanonicalMetadata>()
-
-    data class CanonicalMetadata(
-        val isrc: String?,
-        val title: String,
-        val artist: String,
-        val album: String,
-        val durationMs: Long,
-        val primaryGenre: String = "",
-        val highResArtworkUrl: String = ""
-    ) {
-        val canonicalTitle: String
-            get() = title
-        val primaryArtist: String
-            get() = artist
-        val durationSec: Long
-            get() = (durationMs / 1000L).coerceAtLeast(0L)
-    }
+    /** Minimum required confidence score (0..100) to accept a candidate stream. */
+    const val MIN_ACCEPTABLE_CONFIDENCE_SCORE = 70
 
     /**
-     * Returns true if a candidate title/artist is an unrequested cover, tribute, karaoke, slowed/reverb, or ringtone.
+     * Strict negative keywords that indicate a vocal-stripped instrumental, karaoke,
+     * backing track, tutorial, or cover. Any stream or search candidate containing these
+     * tokens is immediately disqualified unless the user's query explicitly contains the keyword.
      */
-    fun isDisqualifiedCoverOrRemix(
+    val BANNED_INSTRUMENTAL_KEYWORDS = listOf(
+        "instrumental",
+        "karaoke",
+        "backing track",
+        "minus one",
+        "no vocal",
+        "no vocals",
+        "off vocal",
+        "off-vocal",
+        "piano tutorial",
+        "guitar tutorial",
+        "acoustic cover",
+        "guitar backing",
+        "backing guitar",
+        "without vocals",
+        "vocalless",
+        "vocal-less",
+        "instrumental version",
+        "instrumental mix",
+        "karaoke version",
+        "piano cover",
+        "guitar cover",
+        "flute cover",
+        "violin cover",
+        "drum cover",
+        "bass cover",
+        "8d audio",
+        "nightcore",
+        "slowed and reverb",
+        "slowed + reverb",
+        "sped up",
+        "chopped and screwed",
+        "lofi flip",
+        "tribute to",
+        "made famous by",
+        "in the style of",
+        "originally performed by",
+        "ringtone"
+    )
+
+    private val SECONDARY_COVER_MODIFIERS = listOf(
+        "cover",
+        "tribute",
+        "parody",
+        "reprise",
+        "fan made",
+        "fanmade",
+        "amateur",
+        "unplugged cover"
+    )
+
+    /**
+     * Positive vocal hierarchy markers that identify authentic vocal master recordings.
+     */
+    private val VOCAL_MASTER_MARKERS = listOf(
+        "official audio",
+        "official music video",
+        "official video",
+        "official lyric video",
+        "original motion picture soundtrack",
+        "full video",
+        "full audio"
+    )
+
+    data class CanonicalMetadata(
+        val title: String,
+        val artist: String,
+        val album: String = "Single",
+        val durationSec: Long = 0L,
+        val isrc: String? = null,
+        val highResArtworkUrl: String? = null
+    )
+
+    data class CanonicalTrackInfo(
+        val canonicalTitle: String,
+        val primaryArtist: String,
+        val album: String,
+        val durationMs: Long,
+        val isrc: String = "",
+        val highResArtworkUrl: String = ""
+    )
+
+    data class CanonicalTrackMetadata(
+        val isrc: String = "",
+        val canonicalTitle: String,
+        val canonicalArtist: String,
+        val albumName: String,
+        val primaryGenreName: String,
+        val trackTimeMillis: Long,
+        val releaseYear: Int,
+        val trackNumber: Int = 1,
+        val highResArtworkUrl: String,
+        val previewStreamUrl: String = ""
+    )
+
+    data class CandidateScoreResult(
+        val totalScore: Int,
+        val isrcMatched: Boolean,
+        val titleArtistSimilarity: Double,
+        val durationDeltaMs: Long,
+        val isDurationWithinTolerance: Boolean,
+        val isAccepted: Boolean,
+        val rejectionReason: String? = null
+    )
+
+    /**
+     * Strict negative filter that inspects candidate stream titles, descriptions, and
+     * channel/artist names for banned instrumental, karaoke, backing track, or cover markers.
+     *
+     * Returns true if the candidate MUST be discarded.
+     */
+    fun isBannedInstrumentalOrKaraoke(
         candidateTitle: String,
-        candidateArtist: String,
-        referenceQueryOrTitle: String
+        candidateArtistOrChannel: String = "",
+        candidateDescription: String = "",
+        userQuery: String = ""
     ): Boolean {
-        val candCombined = "${candidateTitle.lowercase()} ${candidateArtist.lowercase()}"
-        val refLower = referenceQueryOrTitle.lowercase()
-        val disqualifiers = listOf(
-            "cover", "tribute", "karaoke", "ringtone", "nightcore", "8d audio", "slowed", "reverb", "instrumental version"
-        )
-        for (bad in disqualifiers) {
-            if (candCombined.contains(bad) && !refLower.contains(bad)) {
+        val candTitleLower = candidateTitle.lowercase()
+        val candArtistLower = candidateArtistOrChannel.lowercase()
+        val candDescLower = candidateDescription.lowercase()
+        val queryLower = userQuery.lowercase()
+
+        for (keyword in BANNED_INSTRUMENTAL_KEYWORDS) {
+            val inCandidate = candTitleLower.contains(keyword) ||
+                candArtistLower.contains(keyword) ||
+                candDescLower.contains(keyword)
+            if (inCandidate && !queryLower.contains(keyword)) {
                 return true
             }
         }
@@ -76,499 +178,622 @@ object StreamMatcher {
     }
 
     /**
-     * Alias for fetchCanonicalMetadataFromPublicRegistry used by GlobalMusicSearchEngine.
+     * Computes a priority bonus for authentic vocal master recordings:
+     * - Candidates from "- Topic" (YouTube Official Auto-Generated Music Channels): +30 pts
+     * - Candidates explicitly labeled "Official Audio" or "Official Music Video": +25 pts
+     * - Official Artist Channel / Verified markers: +15 pts
      */
-    fun resolveCanonicalTrack(
-        rawTitle: String,
-        rawArtist: String,
-        fallbackDurationMs: Long = 0L
-    ): CanonicalMetadata {
-        return fetchCanonicalMetadataFromPublicRegistry(rawTitle, rawArtist, fallbackDurationMs)
-    }
-
-    /**
-     * Extracts normalized canonical metadata from an AudioTrack, enriching from the in-memory
-     * canonical cache if previously resolved.
-     */
-    fun extractCanonicalMetadata(track: AudioTrack): CanonicalMetadata {
-        val cleanTitle = normalizeTitle(track.title)
-        val primaryArtist = extractPrimaryArtist(track.artist)
-        val cacheKey = "${cleanTitle.lowercase()}|${primaryArtist.lowercase()}"
-
-        canonicalCache[cacheKey]?.let { cached ->
-            return cached.copy(
-                isrc = sanitizeIsrc(track.isrc) ?: cached.isrc,
-                durationMs = if (track.durationMs > 10_000L) track.durationMs else cached.durationMs
-            )
-        }
-
-        return CanonicalMetadata(
-            isrc = sanitizeIsrc(track.isrc),
-            title = cleanTitle.ifBlank { track.title.trim() },
-            artist = primaryArtist.ifBlank { track.artist.trim() },
-            album = track.album.trim(),
-            durationMs = track.durationMs,
-            primaryGenre = track.genre,
-            highResArtworkUrl = upgradeArtworkToHighRes(track.artworkUrl)
-        )
-    }
-
-    /**
-     * Queries public search registries (iTunes Search API & MusicBrainz) to retrieve
-     * canonical Title, Primary Artist, Exact Duration (ms), Primary Genre, 1400x1400 Artwork, and ISRC.
-     */
-    fun fetchCanonicalMetadataFromPublicRegistry(
-        rawTitle: String,
-        rawArtist: String,
-        fallbackDurationMs: Long = 0L
-    ): CanonicalMetadata {
-        val cleanTitle = normalizeTitle(rawTitle).ifBlank { rawTitle.trim() }
-        val primaryArtist = extractPrimaryArtist(rawArtist).ifBlank { rawArtist.trim() }
-        val cacheKey = "${cleanTitle.lowercase()}|${primaryArtist.lowercase()}"
-
-        canonicalCache[cacheKey]?.let { return it }
-
-        // Stage 1: Query iTunes Search API for canonical trackTimeMillis, primaryGenreName, and 1400x1400 artwork
-        try {
-            val encodedTerm = URLEncoder.encode("$cleanTitle $primaryArtist", "UTF-8")
-            val itunesUrl = "https://itunes.apple.com/search?term=$encodedTerm&entity=song&limit=5"
-            val request = Request.Builder()
-                .url(itunesUrl)
-                .header("User-Agent", "FlowAudio/2.0 (Android; CanonicalRegistry)")
-                .build()
-
-            httpClient.newCall(request).execute().use { response ->
-                if (response.isSuccessful) {
-                    val body = response.body?.string().orEmpty()
-                    val json = JSONObject(body)
-                    val results = json.optJSONArray("results")
-                    if (results != null && results.length() > 0) {
-                        var bestMatch: JSONObject? = null
-                        var bestSim = 0.0
-
-                        for (i in 0 until results.length()) {
-                            val item = results.getJSONObject(i)
-                            val candTitle = item.optString("trackName", "")
-                            val candArtist = item.optString("artistName", "")
-                            val candDurMs = item.optLong("trackTimeMillis", 0L)
-
-                            if (fallbackDurationMs > 10_000L && candDurMs > 0L) {
-                                if (!isDurationValid(candDurMs, fallbackDurationMs)) continue
-                            }
-
-                            val titleSim = calculateTitleSimilarityPercent(candTitle, cleanTitle) / 100.0
-                            val artistSim = maxOf(
-                                calculateTokenSimilarity(extractPrimaryArtist(candArtist), primaryArtist),
-                                calculateLevenshteinSimilarity(extractPrimaryArtist(candArtist), primaryArtist)
-                            )
-                            val combined = (titleSim * 0.6) + (artistSim * 0.4)
-                            if (combined > bestSim && titleSim >= 0.85) {
-                                bestSim = combined
-                                bestMatch = item
-                            }
-                        }
-
-                        if (bestMatch != null) {
-                            val resolvedTitle = bestMatch.optString("trackName", rawTitle).trim()
-                            val resolvedArtist = bestMatch.optString("artistName", rawArtist).trim()
-                            val resolvedAlbum = bestMatch.optString("collectionName", "").trim()
-                            val resolvedDurationMs = bestMatch.optLong("trackTimeMillis", fallbackDurationMs)
-                            val resolvedGenre = bestMatch.optString("primaryGenreName", "")
-                            val rawArt = bestMatch.optString("artworkUrl100", "")
-                            val hiResArt = upgradeArtworkToHighRes(rawArt)
-                            val resolvedIsrc = resolveIsrcIfMissing(resolvedTitle, resolvedArtist)
-
-                            val canonical = CanonicalMetadata(
-                                isrc = resolvedIsrc,
-                                title = normalizeTitle(resolvedTitle).ifBlank { resolvedTitle },
-                                artist = extractPrimaryArtist(resolvedArtist).ifBlank { resolvedArtist },
-                                album = resolvedAlbum,
-                                durationMs = if (resolvedDurationMs > 0L) resolvedDurationMs else fallbackDurationMs,
-                                primaryGenre = resolvedGenre,
-                                highResArtworkUrl = hiResArt
-                            )
-                            canonicalCache[cacheKey] = canonical
-                            return canonical
-                        }
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            runCatching { Log.d(TAG, "iTunes canonical lookup failed: ${e.message}") }
-        }
-
-        // Stage 2: Query MusicBrainz Open Registry for authoritative recording duration & ISRC
-        try {
-            val mbQuery = URLEncoder.encode("recording:\"$cleanTitle\" AND artist:\"$primaryArtist\"", "UTF-8")
-            val mbUrl = "https://musicbrainz.org/ws/2/recording/?query=$mbQuery&limit=3&fmt=json"
-            val request = Request.Builder()
-                .url(mbUrl)
-                .header("User-Agent", "FlowAudio/2.0 (https://flowaudio.io)")
-                .build()
-
-            httpClient.newCall(request).execute().use { response ->
-                if (response.isSuccessful) {
-                    val body = response.body?.string().orEmpty()
-                    val json = JSONObject(body)
-                    val recordings = json.optJSONArray("recordings")
-                    if (recordings != null && recordings.length() > 0) {
-                        for (i in 0 until recordings.length()) {
-                            val rec = recordings.getJSONObject(i)
-                            val recTitle = rec.optString("title", "")
-                            val recLengthMs = rec.optLong("length", 0L)
-                            if (calculateTitleSimilarityPercent(recTitle, cleanTitle) >= MATCH_THRESHOLD_PERCENT) {
-                                if (fallbackDurationMs <= 10_000L || isDurationValid(recLengthMs, fallbackDurationMs)) {
-                                    val isrcsArray = rec.optJSONArray("isrcs")
-                                    val firstIsrc = if (isrcsArray != null && isrcsArray.length() > 0) {
-                                        sanitizeIsrc(isrcsArray.optString(0))
-                                    } else {
-                                        null
-                                    }
-                                    val canonical = CanonicalMetadata(
-                                        isrc = firstIsrc,
-                                        title = cleanTitle,
-                                        artist = primaryArtist,
-                                        album = "",
-                                        durationMs = if (recLengthMs > 0L) recLengthMs else fallbackDurationMs
-                                    )
-                                    canonicalCache[cacheKey] = canonical
-                                    return canonical
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            runCatching { Log.d(TAG, "MusicBrainz canonical lookup failed: ${e.message}") }
-        }
-
-        val fallbackCanonical = CanonicalMetadata(
-            isrc = resolveIsrcIfMissing(cleanTitle, primaryArtist),
-            title = cleanTitle,
-            artist = primaryArtist,
-            album = "",
-            durationMs = fallbackDurationMs
-        )
-        canonicalCache[cacheKey] = fallbackCanonical
-        return fallbackCanonical
-    }
-
-    /**
-     * Upgrades iTunes / Apple Music / Deezer artwork URLs to 1400x1400 high-resolution cover art.
-     */
-    fun upgradeArtworkToHighRes(artworkUrl: String?): String {
-        if (artworkUrl.isNullOrBlank()) return ""
-        return artworkUrl
-            .replace("100x100bb", "1400x1400bb")
-            .replace("600x600bb", "1400x1400bb")
-            .replace("250x250-000000-80-0-0", "1000x1000-000000-80-0-0")
-            .replace("500x500-000000-80-0-0", "1000x1000-000000-80-0-0")
-    }
-
-    /**
-     * Strict Duration Sanity Filter:
-     * Returns true ONLY if candidateDurationMs is within ±3000ms (±3 seconds) of canonicalDurationMs.
-     */
-    fun isDurationValid(candidateDurationMs: Long, canonicalDurationMs: Long): Boolean {
-        if (canonicalDurationMs <= 10_000L || candidateDurationMs <= 0L) return true
-        // Reject 30s previews when target is a full-length song
-        if (candidateDurationMs in 1_000L..45_000L && canonicalDurationMs > 60_000L) {
-            return false
-        }
-        return abs(candidateDurationMs - canonicalDurationMs) <= MAX_DURATION_DEVIATION_MS
-    }
-
-    /**
-     * Sanitizes and validates an ISRC (12 alphanumeric characters, e.g., "USUM71703861").
-     */
-    fun sanitizeIsrc(raw: String?): String? {
-        if (raw.isNullOrBlank()) return null
-        val cleaned = raw.replace("-", "").replace(" ", "").trim().uppercase()
-        return if (cleaned.length == 12 && cleaned.matches(Regex("""^[A-Z]{2}[A-Z0-9]{3}[0-9]{7}$"""))) {
-            cleaned
-        } else if (cleaned.length in 10..15) {
-            cleaned
-        } else {
-            null
-        }
-    }
-
-    /**
-     * Strips noise, parentheses, bracketed tags, soundtrack suffixes, feat/ft credits,
-     * remaster tags, audio/video indicators, and punctuation.
-     */
-    fun normalizeTitle(text: String): String {
-        return text
-            .lowercase()
-            .replace("&quot;", "\"")
-            .replace("&amp;", "&")
-            .replace("&#039;", "'")
-            .replace(Regex("""\([^)]*\)"""), " ")
-            .replace(Regex("""\[[^]]*]"""), " ")
-            .replace(
-                Regex("""(?i)\b(feat|ft|featuring|from\s+the\s+original\s+motion\s+picture|original\s+motion\s+picture\s+soundtrack|original\s+soundtrack|soundtrack\s+version|film\s+version|official\s+video|official\s+audio|official\s+music\s+video|lyric\s+video|lyrics|remastered|remaster|deluxe\s+edition|anniversary\s+edition|bonus\s+track|4k|hd|hq|audio|video|original\s+mix|extended\s+mix|radio\s+edit)\b.*"""),
-                " "
-            )
-            .replace(Regex("""[^a-z0-9\s]"""), " ")
-            .replace(Regex("""\s+"""), " ")
-            .trim()
-    }
-
-    /**
-     * Extracts the primary artist name, stripping secondary features and channel suffixes.
-     */
-    fun extractPrimaryArtist(artist: String): String {
-        val firstSplit = artist.split(
-            ",", "&", "feat.", "ft.", "feat", "ft", "•", "/", "-", "with", "vs", "pres."
-        ).firstOrNull()?.trim() ?: artist
-
-        return firstSplit
-            .lowercase()
-            .replace("&quot;", "\"")
-            .replace("&amp;", " ")
-            .replace("&#039;", "'")
-            .replace(Regex("""(?i)\b(vevo|official|topic|music|channel)\b"""), " ")
-            .replace(Regex("""[^a-z0-9\s]"""), " ")
-            .replace(Regex("""\s+"""), " ")
-            .trim()
-    }
-
-    /**
-     * Computes normalized Levenshtein similarity in [0.0, 1.0].
-     */
-    fun calculateLevenshteinSimilarity(s1: String, s2: String): Double {
-        if (s1 == s2) return 1.0
-        if (s1.isEmpty() || s2.isEmpty()) return 0.0
-        val len1 = s1.length
-        val len2 = s2.length
-        val dp = IntArray(len2 + 1) { it }
-        for (i in 1..len1) {
-            var prev = dp[0]
-            dp[0] = i
-            for (j in 1..len2) {
-                val temp = dp[j]
-                val cost = if (s1[i - 1] == s2[j - 1]) 0 else 1
-                dp[j] = minOf(dp[j] + 1, dp[j - 1] + 1, prev + cost)
-                prev = temp
-            }
-        }
-        val maxLen = maxOf(len1, len2)
-        return (1.0 - dp[len2].toDouble() / maxLen).coerceIn(0.0, 1.0)
-    }
-
-    /**
-     * Computes token overlap similarity in [0.0, 1.0] to prevent single-word collisions.
-     */
-    fun calculateTokenSimilarity(s1: String, s2: String): Double {
-        val tokens1 = s1.split(" ").filter { it.isNotBlank() }
-        val tokens2 = s2.split(" ").filter { it.isNotBlank() }
-        if (tokens1.isEmpty() || tokens2.isEmpty()) return 0.0
-        if (tokens1 == tokens2) return 1.0
-
-        var matchedCount = 0.0
-        for (t1 in tokens1) {
-            val bestTokenMatch = tokens2.maxOfOrNull { t2 ->
-                if (t1 == t2) 1.0
-                else if (t1.length >= 4 && t2.length >= 4 && calculateLevenshteinSimilarity(t1, t2) >= 0.85) 0.90
-                else 0.0
-            } ?: 0.0
-            matchedCount += bestTokenMatch
-        }
-        val denominator = maxOf(tokens1.size, tokens2.size).toDouble()
-        return (matchedCount / denominator).coerceIn(0.0, 1.0)
-    }
-
-    /**
-     * Computes normalized title similarity percentage (0..100).
-     */
-    fun calculateTitleSimilarityPercent(candidateTitle: String, targetTitle: String): Int {
-        val normCandTitle = normalizeTitle(candidateTitle)
-        val normTargetTitle = normalizeTitle(targetTitle)
-        if (normCandTitle.isBlank() || normTargetTitle.isBlank()) return 0
-
-        val titleLev = calculateLevenshteinSimilarity(normCandTitle, normTargetTitle)
-        val titleTok = calculateTokenSimilarity(normCandTitle, normTargetTitle)
-        val combinedTitleSim = when {
-            normCandTitle == normTargetTitle -> 1.0
-            normCandTitle.startsWith(normTargetTitle) || normTargetTitle.startsWith(normCandTitle) -> 0.95
-            normCandTitle.contains(normTargetTitle) || normTargetTitle.contains(normCandTitle) -> 0.90
-            else -> (titleTok * 0.70) + (titleLev * 0.30)
-        }
-        return (combinedTitleSim * 100.0).toInt().coerceIn(0, 100)
-    }
-
-    /**
-     * Computes Match Confidence Score (0–100%):
-     * - Enforces strict ±3s duration sanity filter and >= 85% normalized title similarity.
-     * - Title Similarity: 40 points
-     * - Artist Similarity: 40 points
-     * - Duration Sanity: 20 points (Strict ±3s tolerance)
-     */
-    fun computeMatchConfidenceScore(
+    fun computeVocalMasterPriorityBonus(
         candidateTitle: String,
-        candidateArtist: String,
-        targetTitle: String,
-        targetArtist: String,
-        candidateDurationSec: Long,
-        targetDurationSec: Long
+        candidateArtistOrChannel: String = ""
     ): Int {
-        // 1. Duration Sanity Filter with strict ±3s limit
-        if (targetDurationSec > 10L && candidateDurationSec > 0L) {
-            if (candidateDurationSec in 1L..45L && targetDurationSec > 60L) {
-                return 0
-            }
-            val diffSec = abs(candidateDurationSec - targetDurationSec)
-            if (diffSec > MAX_DURATION_DEVIATION_SEC) {
-                return 0 // Disqualified by duration (>3s discrepancy)
-            }
-        } else if (candidateDurationSec in 1L..45L && targetDurationSec > 60L) {
-            return 0
+        val titleLower = candidateTitle.lowercase()
+        val artistLower = candidateArtistOrChannel.lowercase()
+        var bonus = 0
+
+        if (artistLower.endsWith("- topic") || artistLower.contains(" - topic")) {
+            bonus += 30
+        }
+        if (titleLower.contains("official audio")) {
+            bonus += 28
+        } else if (titleLower.contains("official music video") || titleLower.contains("official video")) {
+            bonus += 24
+        } else if (VOCAL_MASTER_MARKERS.any { titleLower.contains(it) }) {
+            bonus += 18
         }
 
-        // 2. Reject unwanted remix/karaoke/ringtone/cover collisions
-        val rawCandLower = candidateTitle.lowercase()
-        val rawTargetLower = targetTitle.lowercase()
-        val disqualifiers = listOf(
-            "ringtone", "nightcore", "karaoke", "8d audio", "slowed", "reverb", "tribute", "cover version", "instrumental"
-        )
-        for (bad in disqualifiers) {
-            if (rawCandLower.contains(bad) && !rawTargetLower.contains(bad)) {
-                return 0
-            }
+        if (artistLower.contains("official") || artistLower.contains("vevo")) {
+            bonus += 12
         }
 
-        val normCandTitle = normalizeTitle(candidateTitle)
-        val normTargetTitle = normalizeTitle(targetTitle)
-        if (normCandTitle.isBlank() || normTargetTitle.isBlank()) return 0
-
-        // 3. Title Similarity Check (must exceed 85% similarity threshold)
-        val titleSimPercent = calculateTitleSimilarityPercent(candidateTitle, targetTitle)
-        if (titleSimPercent < MATCH_THRESHOLD_PERCENT) {
-            return 0
-        }
-        val titlePoints = (titleSimPercent / 100.0 * 40.0).coerceIn(0.0, 40.0)
-
-        // 4. Artist Matching (40 points)
-        val normTargetArtist = extractPrimaryArtist(targetArtist)
-        val normCandArtist = extractPrimaryArtist(candidateArtist)
-
-        val artistSim = when {
-            normTargetArtist.isBlank() -> 0.85
-            normCandArtist == normTargetArtist -> 1.0
-            normCandArtist.contains(normTargetArtist) || normTargetArtist.contains(normCandArtist) -> 0.92
-            else -> maxOf(
-                calculateTokenSimilarity(normCandArtist, normTargetArtist),
-                calculateLevenshteinSimilarity(normCandArtist, normTargetArtist)
-            )
-        }
-        val artistPoints = (artistSim * 40.0).coerceIn(0.0, 40.0)
-
-        // 5. Duration Points (20 points)
-        val durationPoints = if (targetDurationSec > 10L && candidateDurationSec > 0L) {
-            val diffSec = abs(candidateDurationSec - targetDurationSec)
-            when {
-                diffSec <= 1L -> 20.0
-                diffSec <= 2L -> 18.0
-                diffSec <= 3L -> 16.0
-                else -> 0.0
-            }
-        } else {
-            20.0
-        }
-
-        return (titlePoints + artistPoints + durationPoints).toInt().coerceIn(0, 100)
+        return bonus
     }
 
-    /**
-     * Cross-Provider Matching Decision:
-     * Returns true ONLY if:
-     * - Candidate and Target have identical ISRC (and valid duration), OR
-     * - Duration difference is <= 3s AND normalized Title similarity >= 85% AND overall confidence score >= 85%.
-     */
+    fun extractCanonicalMetadata(track: AudioTrack): CanonicalMetadata {
+        return CanonicalMetadata(
+            title = track.title,
+            artist = track.artist.replace("- Topic", "").trim(),
+            album = track.album,
+            durationSec = (track.durationMs / 1000L).coerceAtLeast(0L),
+            isrc = track.effectiveCanonicalIsrc,
+            highResArtworkUrl = track.artworkUrl
+        )
+    }
+
+    suspend fun resolveCanonicalTrack(
+        rawTitle: String,
+        rawArtist: String,
+        fallbackDurationMs: Long = 0L
+    ): CanonicalTrackInfo? = withContext(Dispatchers.IO) {
+        val fetched = fetchCanonicalMetadata(
+            title = rawTitle,
+            artist = rawArtist,
+            existingDurationMs = fallbackDurationMs
+        )
+        CanonicalTrackInfo(
+            canonicalTitle = fetched.canonicalTitle,
+            primaryArtist = fetched.canonicalArtist,
+            album = fetched.albumName,
+            durationMs = fetched.trackTimeMillis,
+            isrc = fetched.isrc,
+            highResArtworkUrl = fetched.highResArtworkUrl
+        )
+    }
+
     fun isMatch(
         candidateTitle: String,
         candidateArtist: String,
         targetTitle: String,
         targetArtist: String,
-        candidateDurationSec: Long,
-        targetDurationSec: Long,
+        candidateDurationSec: Long = 0L,
+        targetDurationSec: Long = 0L,
         candidateIsrc: String? = null,
         targetIsrc: String? = null
     ): Boolean {
-        val candIsrc = sanitizeIsrc(candidateIsrc)
-        val targIsrc = sanitizeIsrc(targetIsrc)
-
-        // Strict Duration Sanity Check: tolerance is strictly ±3 seconds
-        if (targetDurationSec > 10L && candidateDurationSec > 0L) {
-            if (abs(candidateDurationSec - targetDurationSec) > MAX_DURATION_DEVIATION_SEC) {
-                return false
-            }
-        }
-
-        // ISRC Match
-        if (candIsrc != null && targIsrc != null) {
-            return candIsrc.equals(targIsrc, ignoreCase = true)
-        }
-
-        val score = computeMatchConfidenceScore(
+        return computeMatchConfidenceScore(
+            canonicalTitle = targetTitle,
+            canonicalArtist = targetArtist,
+            canonicalDurationMs = targetDurationSec * 1000L,
+            canonicalIsrc = targetIsrc.orEmpty(),
             candidateTitle = candidateTitle,
             candidateArtist = candidateArtist,
-            targetTitle = targetTitle,
-            targetArtist = targetArtist,
-            candidateDurationSec = candidateDurationSec,
-            targetDurationSec = targetDurationSec
-        )
-
-        return score >= MATCH_THRESHOLD_PERCENT
+            candidateDurationMs = candidateDurationSec * 1000L,
+            candidateIsrc = candidateIsrc.orEmpty()
+        ).isAccepted
     }
 
     /**
-     * Resolves canonical ISRC from public catalog registries if missing on the track.
+     * Queries iTunes Search API and Deezer Canonical Search API to extract the official
+     * canonical ISRC, exact duration (`trackTimeMillis`), `primaryGenreName`, `albumName`,
+     * and 1000x1000 artwork URL.
      */
-    fun resolveIsrcIfMissing(title: String, artist: String): String? {
-        val cleanTitle = normalizeTitle(title).ifBlank { title.trim() }
-        val primaryArtist = extractPrimaryArtist(artist).ifBlank { artist.trim() }
-        return try {
-            val encoded = URLEncoder.encode("track:\"$cleanTitle\" artist:\"$primaryArtist\"", "UTF-8")
-            val request = Request.Builder()
-                .url("https://api.deezer.com/search?q=$encoded&limit=3")
-                .header("User-Agent", "FlowLossless/2.0 (Android; ISRC-Resolver)")
-                .build()
+    suspend fun fetchCanonicalMetadata(
+        title: String,
+        artist: String,
+        existingIsrc: String = "",
+        existingDurationMs: Long = 0L
+    ): CanonicalTrackMetadata = withContext(Dispatchers.IO) {
+        val cleanTitle = cleanSearchText(title)
+        val cleanArtist = if (artist.equals("Unknown Artist", ignoreCase = true)) "" else cleanSearchText(artist)
 
-            httpClient.newCall(request).execute().use { response ->
-                if (response.isSuccessful) {
-                    val body = response.body?.string().orEmpty()
-                    val json = JSONObject(body)
-                    val data = json.optJSONArray("data")
-                    if (data != null && data.length() > 0) {
-                        val first = data.getJSONObject(0)
-                        val candTitle = first.optString("title", "")
-                        if (calculateTitleSimilarityPercent(candTitle, cleanTitle) >= MATCH_THRESHOLD_PERCENT) {
-                            val trackId = first.optLong("id", 0L)
-                            if (trackId > 0L) {
-                                val trackReq = Request.Builder()
-                                    .url("https://api.deezer.com/track/$trackId")
-                                    .header("User-Agent", "FlowLossless/2.0")
-                                    .build()
-                                httpClient.newCall(trackReq).execute().use { trackResp ->
-                                    if (trackResp.isSuccessful) {
-                                        val trackJson = JSONObject(trackResp.body?.string().orEmpty())
-                                        val isrc = trackJson.optString("isrc", "")
-                                        return sanitizeIsrc(isrc)
-                                    }
-                                }
-                            }
-                        }
+        val itunesMeta = queryItunesCanonicalMetadata(cleanTitle, cleanArtist, existingDurationMs)
+        val deezerMeta = queryDeezerCanonicalMetadata(cleanTitle, cleanArtist, existingIsrc, itunesMeta?.trackTimeMillis ?: existingDurationMs)
+
+        val resolvedIsrc = when {
+            existingIsrc.isNotBlank() -> existingIsrc.trim().uppercase()
+            !deezerMeta?.isrc.isNullOrBlank() -> deezerMeta!!.isrc.trim().uppercase()
+            !itunesMeta?.isrc.isNullOrBlank() -> itunesMeta!!.isrc.trim().uppercase()
+            else -> ""
+        }
+
+        val resolvedDurationMs = when {
+            itunesMeta != null && itunesMeta.trackTimeMillis > 30_000L -> itunesMeta.trackTimeMillis
+            deezerMeta != null && deezerMeta.trackTimeMillis > 30_000L -> deezerMeta.trackTimeMillis
+            existingDurationMs > 30_000L -> existingDurationMs
+            else -> 0L
+        }
+
+        val resolvedArtwork = when {
+            !itunesMeta?.highResArtworkUrl.isNullOrBlank() -> itunesMeta!!.highResArtworkUrl
+            !deezerMeta?.highResArtworkUrl.isNullOrBlank() -> deezerMeta!!.highResArtworkUrl
+            else -> ""
+        }
+
+        CanonicalTrackMetadata(
+            isrc = resolvedIsrc,
+            canonicalTitle = itunesMeta?.canonicalTitle?.takeIf { it.isNotBlank() }
+                ?: deezerMeta?.canonicalTitle?.takeIf { it.isNotBlank() }
+                ?: title,
+            canonicalArtist = itunesMeta?.canonicalArtist?.takeIf { it.isNotBlank() }
+                ?: deezerMeta?.canonicalArtist?.takeIf { it.isNotBlank() }
+                ?: artist,
+            albumName = itunesMeta?.albumName?.takeIf { it.isNotBlank() }
+                ?: deezerMeta?.albumName?.takeIf { it.isNotBlank() }
+                ?: title,
+            primaryGenreName = itunesMeta?.primaryGenreName?.takeIf { it.isNotBlank() }
+                ?: deezerMeta?.primaryGenreName?.takeIf { it.isNotBlank() }
+                ?: "Music",
+            trackTimeMillis = resolvedDurationMs,
+            releaseYear = itunesMeta?.releaseYear?.takeIf { it > 1900 }
+                ?: deezerMeta?.releaseYear?.takeIf { it > 1900 }
+                ?: 2024,
+            trackNumber = itunesMeta?.trackNumber ?: deezerMeta?.trackNumber ?: 1,
+            highResArtworkUrl = resolvedArtwork,
+            previewStreamUrl = itunesMeta?.previewStreamUrl?.takeIf { it.isNotBlank() }
+                ?: deezerMeta?.previewStreamUrl.orEmpty()
+        )
+    }
+
+    private fun queryItunesCanonicalMetadata(
+        cleanTitle: String,
+        cleanArtist: String,
+        referenceDurationMs: Long
+    ): CanonicalTrackMetadata? {
+        return try {
+            val term = URLEncoder.encode("$cleanTitle $cleanArtist".trim(), "UTF-8")
+            val endpoint = "https://itunes.apple.com/search?term=$term&entity=song&limit=8"
+            val body = httpGet(endpoint, timeoutMs = 2000) ?: return null
+            val root = JSONObject(body)
+            val results = root.optJSONArray("results") ?: return null
+            if (results.length() == 0) return null
+
+            var bestObj: JSONObject? = null
+            var bestScore = -1.0
+
+            for (i in 0 until results.length()) {
+                val obj = results.optJSONObject(i) ?: continue
+                val trackName = obj.optString("trackName", "")
+                val artistName = obj.optString("artistName", "")
+                if (trackName.isBlank() || artistName.isBlank()) continue
+                val collectionName = obj.optString("collectionName", "")
+                val durationMs = obj.optLong("trackTimeMillis", 0L)
+
+                if (isDisqualifiedCoverOrRemix(cleanTitle, cleanArtist, trackName, artistName, collectionName)) {
+                    continue
+                }
+
+                val titleSim = normalizedLevenshteinSimilarity(cleanTitle, cleanSearchText(trackName))
+                val artistSim = if (cleanArtist.isBlank()) 0.90 else bestArtistSimilarity(cleanArtist, artistName)
+                val durationPenalty = if (referenceDurationMs > 30_000L && durationMs > 30_000L) {
+                    val diffSec = abs(referenceDurationMs - durationMs) / 1000.0
+                    if (diffSec > 8.0) -0.35 else -(diffSec * 0.02)
+                } else 0.0
+
+                val combined = (titleSim * 0.60) + (artistSim * 0.40) + durationPenalty
+                if (combined > bestScore) {
+                    bestScore = combined
+                    bestObj = obj
+                }
+            }
+
+            val chosen = bestObj ?: return null
+            if (bestScore < 0.55) return null
+
+            val rawArtwork = chosen.optString("artworkUrl100", "")
+            val highResArt = if (rawArtwork.isNotBlank()) {
+                rawArtwork.replace("100x100bb", "1000x1000bb").replace("100x100", "1000x1000")
+            } else ""
+
+            val releaseDate = chosen.optString("releaseDate", "")
+            val releaseYear = releaseDate.take(4).toIntOrNull() ?: 2024
+
+            CanonicalTrackMetadata(
+                isrc = chosen.optString("isrc", "").uppercase(),
+                canonicalTitle = chosen.optString("trackName", cleanTitle),
+                canonicalArtist = chosen.optString("artistName", cleanArtist),
+                albumName = chosen.optString("collectionName", cleanTitle),
+                primaryGenreName = chosen.optString("primaryGenreName", "Music"),
+                trackTimeMillis = chosen.optLong("trackTimeMillis", referenceDurationMs),
+                releaseYear = releaseYear,
+                trackNumber = chosen.optInt("trackNumber", 1),
+                highResArtworkUrl = highResArt,
+                previewStreamUrl = chosen.optString("previewUrl", "")
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "iTunes canonical metadata lookup failed: ${e.message}")
+            null
+        }
+    }
+
+    private fun queryDeezerCanonicalMetadata(
+        cleanTitle: String,
+        cleanArtist: String,
+        existingIsrc: String,
+        referenceDurationMs: Long
+    ): CanonicalTrackMetadata? {
+        return try {
+            if (existingIsrc.isNotBlank()) {
+                val isrcBody = httpGet("https://api.deezer.com/track/isrc:${URLEncoder.encode(existingIsrc.trim(), "UTF-8")}", timeoutMs = 1800)
+                if (!isrcBody.isNullOrBlank()) {
+                    val obj = JSONObject(isrcBody)
+                    val title = obj.optString("title", "")
+                    if (title.isNotBlank()) {
+                        val artistObj = obj.optJSONObject("artist")
+                        val albumObj = obj.optJSONObject("album")
+                        val durationSec = obj.optLong("duration", 0L)
+                        val releaseDate = obj.optString("release_date", "")
+                        return CanonicalTrackMetadata(
+                            isrc = obj.optString("isrc", existingIsrc).uppercase(),
+                            canonicalTitle = title,
+                            canonicalArtist = artistObj?.optString("name", cleanArtist) ?: cleanArtist,
+                            albumName = albumObj?.optString("title", title) ?: title,
+                            primaryGenreName = "Music",
+                            trackTimeMillis = if (durationSec > 0L) durationSec * 1000L else referenceDurationMs,
+                            releaseYear = releaseDate.take(4).toIntOrNull() ?: 2024,
+                            trackNumber = obj.optInt("track_position", 1),
+                            highResArtworkUrl = albumObj?.optString("cover_xl", "")?.ifBlank {
+                                albumObj.optString("cover_big", "")
+                            }.orEmpty(),
+                            previewStreamUrl = obj.optString("preview", "")
+                        )
                     }
                 }
             }
-            null
-        } catch (e: Exception) {
-            runCatching {
-                Log.d(TAG, "ISRC resolution failed for $cleanTitle by $primaryArtist: ${e.message}")
+
+            val q = if (cleanArtist.isNotBlank()) {
+                "track:\"$cleanTitle\" artist:\"$cleanArtist\""
+            } else {
+                cleanTitle
             }
+            val encoded = URLEncoder.encode(q, "UTF-8")
+            val searchBody = httpGet("https://api.deezer.com/search?q=$encoded&limit=6", timeoutMs = 1800) ?: return null
+            val root = JSONObject(searchBody)
+            val dataArr = root.optJSONArray("data") ?: return null
+            if (dataArr.length() == 0) return null
+
+            var bestObj: JSONObject? = null
+            var bestScore = -1.0
+
+            for (i in 0 until dataArr.length()) {
+                val obj = dataArr.optJSONObject(i) ?: continue
+                val trackTitle = obj.optString("title", "")
+                val artistObj = obj.optJSONObject("artist")
+                val artistName = artistObj?.optString("name", "") ?: ""
+                if (trackTitle.isBlank() || artistName.isBlank()) continue
+                val albumObj = obj.optJSONObject("album")
+                val albumTitle = albumObj?.optString("title", "") ?: ""
+                val durationMs = obj.optLong("duration", 0L) * 1000L
+
+                if (isDisqualifiedCoverOrRemix(cleanTitle, cleanArtist, trackTitle, artistName, albumTitle)) {
+                    continue
+                }
+
+                val titleSim = normalizedLevenshteinSimilarity(cleanTitle, cleanSearchText(trackTitle))
+                val artistSim = if (cleanArtist.isBlank()) 0.90 else bestArtistSimilarity(cleanArtist, artistName)
+                val durationBoost = if (referenceDurationMs > 30_000L && durationMs > 30_000L) {
+                    val delta = abs(referenceDurationMs - durationMs)
+                    if (delta <= STRICT_DURATION_TOLERANCE_MS) 0.15 else if (delta > 8_000L) -0.35 else 0.0
+                } else 0.0
+
+                val score = (titleSim * 0.60) + (artistSim * 0.40) + durationBoost
+                if (score > bestScore) {
+                    bestScore = score
+                    bestObj = obj
+                }
+            }
+
+            val chosen = bestObj ?: return null
+            if (bestScore < 0.55) return null
+
+            val artistObj = chosen.optJSONObject("artist")
+            val albumObj = chosen.optJSONObject("album")
+            val durationMs = chosen.optLong("duration", 0L) * 1000L
+
+            CanonicalTrackMetadata(
+                isrc = chosen.optString("isrc", "").uppercase(),
+                canonicalTitle = chosen.optString("title", cleanTitle),
+                canonicalArtist = artistObj?.optString("name", cleanArtist) ?: cleanArtist,
+                albumName = albumObj?.optString("title", cleanTitle) ?: cleanTitle,
+                primaryGenreName = "Music",
+                trackTimeMillis = if (durationMs > 0L) durationMs else referenceDurationMs,
+                releaseYear = 2024,
+                trackNumber = 1,
+                highResArtworkUrl = albumObj?.optString("cover_xl", "")?.ifBlank {
+                    albumObj.optString("cover_big", "")
+                }.orEmpty(),
+                previewStreamUrl = chosen.optString("preview", "")
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "Deezer canonical metadata lookup failed: ${e.message}")
             null
+        }
+    }
+
+    /**
+     * Evaluates a candidate stream against the canonical track metadata using the Weighted Confidence Matrix:
+     * - ISRC Exact Match: +50 points
+     * - Title & Artist Levenshtein Similarity (> 0.85): +25 points (scaled 0..25 for partial matches >= 0.72)
+     * - Duration Proximity (within ±3.0 seconds of canonical duration): +25 points
+     * - Vocal Master Hierarchy Bonus: up to +30 points for Official Audio / - Topic channels
+     * - Minimum threshold to accept a stream: 70 points.
+     * - Hard guardrails:
+     *   1. Any banned instrumental/karaoke/backing track is immediately rejected.
+     *   2. Any candidate whose duration deviates by more than ±3.0 seconds from a known canonical duration is rejected.
+     */
+    fun computeMatchConfidenceScore(
+        canonicalTitle: String,
+        canonicalArtist: String,
+        canonicalDurationMs: Long,
+        canonicalIsrc: String = "",
+        candidateTitle: String,
+        candidateArtist: String,
+        candidateDurationMs: Long,
+        candidateIsrc: String = "",
+        candidateAlbum: String = ""
+    ): CandidateScoreResult {
+        // 0. Strict negative filter for instrumental/karaoke/backing tracks & covers
+        if (isBannedInstrumentalOrKaraoke(
+                candidateTitle = candidateTitle,
+                candidateArtistOrChannel = candidateArtist,
+                candidateDescription = candidateAlbum,
+                userQuery = "$canonicalTitle $canonicalArtist"
+            )
+        ) {
+            return CandidateScoreResult(
+                totalScore = 0,
+                isrcMatched = false,
+                titleArtistSimilarity = 0.0,
+                durationDeltaMs = abs(canonicalDurationMs - candidateDurationMs),
+                isDurationWithinTolerance = false,
+                isAccepted = false,
+                rejectionReason = "Rejected banned instrumental/karaoke/backing track"
+            )
+        }
+
+        if (isDisqualifiedCoverOrRemix(canonicalTitle, canonicalArtist, candidateTitle, candidateArtist, candidateAlbum)) {
+            return CandidateScoreResult(
+                totalScore = 0,
+                isrcMatched = false,
+                titleArtistSimilarity = 0.0,
+                durationDeltaMs = abs(canonicalDurationMs - candidateDurationMs),
+                isDurationWithinTolerance = false,
+                isAccepted = false,
+                rejectionReason = "Rejected non-canonical cover/remix/karaoke modifier"
+            )
+        }
+
+        // 1. Reject 30-second preview clips when matching full-length tracks
+        if (candidateDurationMs in 1L..59_999L && (canonicalDurationMs >= 60_000L || canonicalDurationMs == 0L)) {
+            return CandidateScoreResult(
+                totalScore = 0,
+                isrcMatched = false,
+                titleArtistSimilarity = 0.0,
+                durationDeltaMs = abs(canonicalDurationMs - candidateDurationMs),
+                isDurationWithinTolerance = false,
+                isAccepted = false,
+                rejectionReason = "Rejected <60s snippet preview (${candidateDurationMs}ms)"
+            )
+        }
+
+        // 2. ISRC Match (+50 points)
+        val isrcMatched = canonicalIsrc.isNotBlank() &&
+            candidateIsrc.isNotBlank() &&
+            canonicalIsrc.trim().equals(candidateIsrc.trim(), ignoreCase = true)
+
+        // 3. Title & Artist Levenshtein Similarity
+        val cleanTargetTitle = cleanSearchText(canonicalTitle)
+        val cleanCandTitle = cleanSearchText(candidateTitle)
+        val titleSim = normalizedLevenshteinSimilarity(cleanTargetTitle, cleanCandTitle)
+
+        val cleanTargetArtist = if (canonicalArtist.equals("Unknown Artist", ignoreCase = true)) "" else cleanSearchText(canonicalArtist)
+        val artistSim = if (cleanTargetArtist.isBlank()) {
+            0.90
+        } else {
+            max(
+                bestArtistSimilarity(cleanTargetArtist, candidateArtist),
+                if (cleanCandTitle.contains(cleanTargetArtist)) 0.88 else 0.0
+            )
+        }
+
+        val combinedSimilarity = (titleSim * 0.58) + (artistSim * 0.42)
+
+        if (!isrcMatched && (titleSim < 0.50 || artistSim < 0.45)) {
+            return CandidateScoreResult(
+                totalScore = 0,
+                isrcMatched = false,
+                titleArtistSimilarity = combinedSimilarity,
+                durationDeltaMs = if (canonicalDurationMs > 30_000L && candidateDurationMs > 30_000L) abs(canonicalDurationMs - candidateDurationMs) else 0L,
+                isDurationWithinTolerance = false,
+                isAccepted = false,
+                rejectionReason = "Low title/artist similarity (title=${"%.2f".format(titleSim)}, artist=${"%.2f".format(artistSim)})"
+            )
+        }
+
+        // 4. Duration Proximity Check (allows studio master vs music video intro/outro differences when title & artist strongly match)
+        val hasBothDurations = canonicalDurationMs >= 60_000L && candidateDurationMs >= 60_000L
+        val durationDeltaMs = if (hasBothDurations) abs(canonicalDurationMs - candidateDurationMs) else 0L
+        val effectiveToleranceMs = when {
+            isrcMatched -> 60_000L
+            titleSim >= 0.82 && artistSim >= 0.75 -> 60_000L
+            combinedSimilarity >= 0.78 -> 25_000L
+            else -> 12_000L
+        }
+        val isDurationValid = !hasBothDurations || durationDeltaMs <= effectiveToleranceMs
+
+        if (hasBothDurations && !isDurationValid) {
+            return CandidateScoreResult(
+                totalScore = 0,
+                isrcMatched = isrcMatched,
+                titleArtistSimilarity = combinedSimilarity,
+                durationDeltaMs = durationDeltaMs,
+                isDurationWithinTolerance = false,
+                isAccepted = false,
+                rejectionReason = "Duration delta ${durationDeltaMs}ms exceeds ±${effectiveToleranceMs}ms tolerance"
+            )
+        }
+
+        val durationPoints = when {
+            hasBothDurations && durationDeltaMs <= 1_500L -> 25
+            hasBothDurations && durationDeltaMs <= STRICT_DURATION_TOLERANCE_MS -> 22
+            hasBothDurations && durationDeltaMs <= 15_000L -> 20
+            hasBothDurations && durationDeltaMs <= effectiveToleranceMs -> 16
+            !hasBothDurations && candidateDurationMs >= 60_000L -> 18
+            else -> 14
+        }
+
+        val similarityPoints = when {
+            combinedSimilarity >= 0.85 -> 25
+            combinedSimilarity >= 0.78 -> 22
+            combinedSimilarity >= 0.70 -> 18
+            combinedSimilarity >= 0.62 -> 12
+            else -> 0
+        }
+
+        val isrcOrVerifiedMetadataPoints = when {
+            isrcMatched -> 50
+            combinedSimilarity >= 0.85 && isDurationValid -> 45
+            combinedSimilarity >= 0.76 && isDurationValid -> 35
+            else -> 0
+        }
+
+        val vocalMasterBonus = computeVocalMasterPriorityBonus(candidateTitle, candidateArtist)
+        val totalScore = (isrcOrVerifiedMetadataPoints + similarityPoints + durationPoints + vocalMasterBonus).coerceAtMost(130)
+        val accepted = isDurationValid && totalScore >= MIN_ACCEPTABLE_CONFIDENCE_SCORE
+
+        return CandidateScoreResult(
+            totalScore = totalScore,
+            isrcMatched = isrcMatched,
+            titleArtistSimilarity = combinedSimilarity,
+            durationDeltaMs = durationDeltaMs,
+            isDurationWithinTolerance = isDurationValid,
+            isAccepted = accepted,
+            rejectionReason = if (accepted) null else "Confidence score $totalScore below threshold $MIN_ACCEPTABLE_CONFIDENCE_SCORE"
+        )
+    }
+
+    /**
+     * Checks if a candidate track is a disqualified instrumental, karaoke, cover, tribute, parody,
+     * slowed/reverb, or sped-up version when the canonical query did not ask for one.
+     */
+    fun isDisqualifiedCoverOrRemix(
+        canonicalTitle: String,
+        canonicalArtist: String,
+        candidateTitle: String,
+        candidateArtist: String,
+        candidateAlbum: String = ""
+    ): Boolean {
+        val targetCombined = "$canonicalTitle $canonicalArtist".lowercase()
+        if (isBannedInstrumentalOrKaraoke(
+                candidateTitle = candidateTitle,
+                candidateArtistOrChannel = candidateArtist,
+                candidateDescription = candidateAlbum,
+                userQuery = targetCombined
+            )
+        ) {
+            return true
+        }
+
+        val candCombined = "$candidateTitle $candidateArtist $candidateAlbum".lowercase()
+        for (modifier in SECONDARY_COVER_MODIFIERS) {
+            if (candCombined.contains(modifier) && !targetCombined.contains(modifier)) {
+                return true
+            }
+        }
+        return false
+    }
+
+    /**
+     * Computes normalized Levenshtein similarity between two strings in `[0.0, 1.0]`.
+     */
+    fun normalizedLevenshteinSimilarity(a: String, b: String): Double {
+        val s1 = a.trim().lowercase()
+        val s2 = b.trim().lowercase()
+        if (s1 == s2) return 1.0
+        if (s1.isEmpty() || s2.isEmpty()) return 0.0
+
+        if (s1.contains(s2) || s2.contains(s1)) {
+            val ratio = min(s1.length, s2.length).toDouble() / max(s1.length, s2.length).toDouble()
+            return max(0.86, ratio)
+        }
+
+        val dist = levenshteinDistance(s1, s2)
+        val maxLen = max(s1.length, s2.length)
+        val rawSim = (1.0 - dist.toDouble() / maxLen.toDouble()).coerceIn(0.0, 1.0)
+
+        val tokens1 = s1.split(" ").filter { it.length > 1 }.toSet()
+        val tokens2 = s2.split(" ").filter { it.length > 1 }.toSet()
+        val tokenSim = if (tokens1.isNotEmpty() && tokens2.isNotEmpty()) {
+            val intersection = tokens1.intersect(tokens2).size.toDouble()
+            intersection / min(tokens1.size, tokens2.size).toDouble()
+        } else 0.0
+
+        return max(rawSim, tokenSim * 0.92)
+    }
+
+    private fun bestArtistSimilarity(canonicalArtist: String, candidateArtist: String): Double {
+        val targetParts = canonicalArtist.lowercase()
+            .split(Regex("[,&/|]|\\bfeat\\.?\\b|\\bft\\.?\\b"))
+            .map { cleanSearchText(it) }
+            .filter { it.length >= 2 }
+        val candParts = candidateArtist.lowercase()
+            .replace("- topic", "")
+            .split(Regex("[,&/|]|\\bfeat\\.?\\b|\\bft\\.?\\b"))
+            .map { cleanSearchText(it) }
+            .filter { it.length >= 2 }
+
+        if (targetParts.isEmpty() || candParts.isEmpty()) {
+            return normalizedLevenshteinSimilarity(cleanSearchText(canonicalArtist), cleanSearchText(candidateArtist))
+        }
+
+        var maxSim = 0.0
+        for (t in targetParts) {
+            for (c in candParts) {
+                val sim = normalizedLevenshteinSimilarity(t, c)
+                if (sim > maxSim) maxSim = sim
+            }
+        }
+        return maxSim
+    }
+
+    private fun levenshteinDistance(lhs: CharSequence, rhs: CharSequence): Int {
+        val lhsLen = lhs.length
+        val rhsLen = rhs.length
+        var cost = IntArray(lhsLen + 1) { it }
+        var newCost = IntArray(lhsLen + 1)
+
+        for (i in 1..rhsLen) {
+            newCost[0] = i
+            for (j in 1..lhsLen) {
+                val match = if (lhs[j - 1] == rhs[i - 1]) 0 else 1
+                val costReplace = cost[j - 1] + match
+                val costInsert = cost[j] + 1
+                val costDelete = newCost[j - 1] + 1
+                newCost[j] = min(min(costInsert, costDelete), costReplace)
+            }
+            val swap = cost
+            cost = newCost
+            newCost = swap
+        }
+        return cost[lhsLen]
+    }
+
+    fun cleanSearchText(raw: String): String {
+        return raw.lowercase()
+            .replace("- topic", " ")
+            .replace(Regex("\\((?:official|lyric|video|audio|remaster(?:ed)?|from\\s+[^)]*|feat\\.?[^)]*|ft\\.?[^)]*)\\)"), " ")
+            .replace(Regex("\\[(?:official|lyric|video|audio|remaster(?:ed)?|from\\s+[^]]*|feat\\.?[^]]*|ft\\.?[^]]*)]"), " ")
+            .replace(Regex("[^a-z0-9\\s]"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+    }
+
+    private fun httpGet(urlStr: String, timeoutMs: Int = 2200): String? {
+        var connection: HttpURLConnection? = null
+        return try {
+            connection = (URL(urlStr).openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = timeoutMs
+                readTimeout = timeoutMs
+                setRequestProperty("Accept", "application/json")
+                setRequestProperty("User-Agent", "FlowHiResAudioEngine/4.0 (Android; Media3)")
+            }
+            if (connection.responseCode in 200..299) {
+                connection.inputStream.bufferedReader().use { it.readText() }
+            } else null
+        } catch (e: Exception) {
+            null
+        } finally {
+            connection?.disconnect()
         }
     }
 }

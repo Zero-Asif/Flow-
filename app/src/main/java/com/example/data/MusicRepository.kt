@@ -48,6 +48,17 @@ class MusicRepository(private val context: Context) {
         loadData()
     }
 
+    private fun isCorruptRawTrackEntry(title: String, artist: String, localPath: String? = null): Boolean {
+        val trimmedTitle = title.trim()
+        val trimmedArtist = artist.trim()
+        if (trimmedTitle.isBlank()) return true
+        if (trimmedArtist.equals("Offline Saved Track", ignoreCase = true)) return true
+        if (trimmedTitle.endsWith("_art", ignoreCase = true) || trimmedTitle.endsWith(" art", ignoreCase = true)) return true
+        if (localPath != null && (localPath.endsWith(".jpg", true) || localPath.endsWith(".png", true))) return true
+        val rawIdRegex = Regex("""^(yt|saavn|deezer|amazon|tidal)[\s_]+[A-Za-z0-9_-]{4,20}(\s+art)?$""", RegexOption.IGNORE_CASE)
+        return rawIdRegex.matches(trimmedTitle)
+    }
+
     private fun serializeTrackToJson(t: AudioTrack): JSONObject {
         val obj = JSONObject()
         obj.put("id", t.id)
@@ -193,21 +204,28 @@ class MusicRepository(private val context: Context) {
             e.printStackTrace()
         }
 
-        // Load downloaded tracks from prefs + scan local downloads directory on device storage
+        // Load downloaded tracks from prefs + purge any corrupt raw-ID or _art entries
         val downloadedTracksJson = prefs.getString("downloaded_tracks", "[]") ?: "[]"
         val downloadedList = mutableListOf<AudioTrack>()
+        var hadCorruptDownloadedEntries = false
         try {
             val jsonArray = JSONArray(downloadedTracksJson)
             for (i in 0 until jsonArray.length()) {
                 val obj = jsonArray.getJSONObject(i)
                 val localPath = obj.optString("localFilePath", null)
+                val rawTitle = obj.optString("title", "")
+                val rawArtist = obj.optString("artist", "Unknown Artist")
+                if (isCorruptRawTrackEntry(rawTitle, rawArtist, localPath)) {
+                    hadCorruptDownloadedEntries = true
+                    continue
+                }
                 val track = AudioTrack(
                     id = obj.getString("id"),
-                    title = obj.getString("title"),
-                    artist = obj.optString("artist", "Unknown Artist"),
+                    title = rawTitle,
+                    artist = rawArtist,
                     album = obj.optString("album", "Downloaded Audio"),
                     durationMs = obj.optLong("durationMs", 180000L),
-                    format = AudioFormat.valueOf(obj.optString("format", "MP3")),
+                    format = runCatching { AudioFormat.valueOf(obj.optString("format", "AAC")) }.getOrDefault(AudioFormat.AAC),
                     sampleRate = obj.optInt("sampleRate", 44100),
                     bitDepth = obj.optInt("bitDepth", 16),
                     bitrateKbps = obj.optInt("bitrateKbps", 320),
@@ -237,13 +255,32 @@ class MusicRepository(private val context: Context) {
             e.printStackTrace()
         }
 
-        // Scan device storage downloads directory for any standalone offline files not yet in prefs
+        // Clean up any stray image/temp files in downloadsDir and scan only valid audio files with human-readable names
         try {
+            val validAudioExtensions = setOf("flac", "m4a", "mp3", "wav", "wave", "alac", "opus")
             val downloadsDir = File(context.filesDir, "downloads")
+            val artworkDir = File(context.filesDir, "downloads_artwork").apply { if (!exists()) mkdirs() }
             if (downloadsDir.exists() && downloadsDir.isDirectory) {
                 downloadsDir.listFiles()?.forEach { file ->
-                    if (file.isFile && file.length() > 5000L && downloadedList.none { it.localFilePath == file.absolutePath }) {
-                        val ext = file.extension.lowercase()
+                    val ext = file.extension.lowercase()
+                    if (ext in setOf("jpg", "jpeg", "png", "webp", "part")) {
+                        if (ext != "part") {
+                            runCatching { file.copyTo(File(artworkDir, file.name), overwrite = true) }
+                        }
+                        runCatching { file.delete() }
+                        return@forEach
+                    }
+                    if (
+                        file.isFile &&
+                        ext in validAudioExtensions &&
+                        file.length() > 50_000L &&
+                        downloadedList.none { it.localFilePath == file.absolutePath }
+                    ) {
+                        val baseName = file.nameWithoutExtension
+                        // Do NOT recover raw ID filenames like "yt_ge4M2dVBgTw" or "*_art" as fake track titles
+                        if (isCorruptRawTrackEntry(baseName.replace("_", " "), "", file.absolutePath)) {
+                            return@forEach
+                        }
                         val fmt = when (ext) {
                             "flac" -> AudioFormat.FLAC
                             "wav", "wave" -> AudioFormat.WAV
@@ -251,24 +288,30 @@ class MusicRepository(private val context: Context) {
                             "aac", "m4a", "mp4" -> AudioFormat.AAC
                             else -> AudioFormat.MP3
                         }
+                        val cleanTitle = baseName.substringAfter(" - ", baseName).replace("_", " ").trim()
+                        val cleanArtist = if (baseName.contains(" - ")) {
+                            baseName.substringBefore(" - ").replace("_", " ").trim()
+                        } else {
+                            "Local Library"
+                        }
                         val sizeMb = String.format(java.util.Locale.US, "%.1f MB", file.length() / (1024.0 * 1024.0))
                         val recoveredTrack = AudioTrack(
-                            id = file.nameWithoutExtension,
-                            title = file.nameWithoutExtension.replace("_", " "),
-                            artist = "Offline Saved Track",
-                            album = "Offline Downloads",
+                            id = baseName,
+                            title = cleanTitle,
+                            artist = cleanArtist,
+                            album = "Flow Downloads",
                             durationMs = 210000L,
                             format = fmt,
                             sampleRate = if (fmt.isLossless) 96000 else 44100,
                             bitDepth = if (fmt.isLossless) 24 else 16,
-                            bitrateKbps = if (fmt.isLossless) 2822 else 320,
+                            bitrateKbps = if (fmt.isLossless) 1411 else 320,
                             genre = "Downloaded",
                             releaseYear = 2025,
                             gradientColors = listOf(0xFF00F0FF, 0xFF7928CA),
                             uriString = file.absolutePath,
                             isDownloaded = true,
                             localFilePath = file.absolutePath,
-                            sourceProvider = "Offline Storage",
+                            sourceProvider = "Flow Downloads",
                             isLocalImport = true,
                             fileSizeFormatted = sizeMb
                         )
@@ -285,6 +328,9 @@ class MusicRepository(private val context: Context) {
 
         _downloadedTracks.value = downloadedList
         _tracks.value = initialTracks
+        if (hadCorruptDownloadedEntries) {
+            saveDownloadedTracks()
+        }
 
         // Load persisted listening history
         val historyJson = prefs.getString("history_tracks_json", "[]") ?: "[]"

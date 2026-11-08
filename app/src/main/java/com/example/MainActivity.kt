@@ -96,6 +96,11 @@ fun MainAppContent(viewModel: MusicViewModel = viewModel()) {
     ) { /* Permission granted or dismissed */ }
 
     LaunchedEffect(Unit) {
+        // TEMPORARY DEBUG FIXTURE: Automatically export raw YTM InnerTube JSON for "Shape of You" in debug builds only
+        if (BuildConfig.DEBUG) {
+            com.example.util.YtmRawJsonDebugExporter.triggerShapeOfYouDebugExportOnce(context)
+        }
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (ContextCompat.checkSelfPermission(
                     context,
@@ -129,14 +134,6 @@ fun MainAppContent(viewModel: MusicViewModel = viewModel()) {
     val history by viewModel.repository.history.collectAsStateWithLifecycle()
     val stats by viewModel.repository.stats.collectAsStateWithLifecycle()
 
-    val searchQuery by viewModel.searchQuery.collectAsStateWithLifecycle()
-    val filterGenre by viewModel.filterGenre.collectAsStateWithLifecycle()
-    val filterFormat by viewModel.filterFormat.collectAsStateWithLifecycle()
-    val filterYear by viewModel.filterYear.collectAsStateWithLifecycle()
-    val searchResults by viewModel.searchResults.collectAsStateWithLifecycle()
-    val searchSuggestions by viewModel.searchSuggestions.collectAsStateWithLifecycle()
-    val categorizedSearchResults by viewModel.categorizedSearchResults.collectAsStateWithLifecycle()
-    val isGlobalSearching by viewModel.isGlobalSearching.collectAsStateWithLifecycle()
     val globalTrendingTracks by viewModel.globalTrendingTracks.collectAsStateWithLifecycle()
 
     val activeLyrics by viewModel.activeLyrics.collectAsStateWithLifecycle()
@@ -148,8 +145,8 @@ fun MainAppContent(viewModel: MusicViewModel = viewModel()) {
     val downloadProgress by viewModel.downloadProgress.collectAsStateWithLifecycle()
     val downloadedTracks by viewModel.downloadedTracks.collectAsStateWithLifecycle()
     val pendingDownloadTrack by viewModel.pendingDownloadTrack.collectAsStateWithLifecycle()
-    val selectedMusicSourceFilter by viewModel.selectedMusicSourceFilter.collectAsStateWithLifecycle()
     val playbackError by viewModel.playbackError.collectAsStateWithLifecycle()
+    val isLoadingTrack by viewModel.isLoadingTrack.collectAsStateWithLifecycle()
     val activeStreamCandidate by viewModel.activeStreamCandidate.collectAsStateWithLifecycle()
 
     Box(modifier = Modifier.fillMaxSize().background(SurfaceDarkVoid)) {
@@ -168,7 +165,8 @@ fun MainAppContent(viewModel: MusicViewModel = viewModel()) {
                             onTogglePlay = { viewModel.togglePlayPause() },
                             onNext = { viewModel.playNext() },
                             onToggleFavorite = { viewModel.toggleFavorite(it) },
-                            onExpand = { viewModel.setNowPlayingExpanded(true) }
+                            onExpand = { viewModel.setNowPlayingExpanded(true) },
+                            isBuffering = isLoadingTrack
                         )
                     }
 
@@ -226,26 +224,12 @@ fun MainAppContent(viewModel: MusicViewModel = viewModel()) {
                         onOpenEqualizer = { selectedNavIndex = 3 }
                     )
                     1 -> SearchScreen(
-                        query = searchQuery,
-                        onQueryChange = { viewModel.onSearchQueryChanged(it) },
-                        selectedGenre = filterGenre,
-                        onSelectGenre = { viewModel.filterGenre.value = it },
-                        selectedFormat = filterFormat,
-                        onSelectFormat = { viewModel.filterFormat.value = it },
-                        selectedYear = filterYear,
-                        onSelectYear = { viewModel.filterYear.value = it },
-                        selectedSourceFilter = selectedMusicSourceFilter,
-                        onSelectSourceFilter = { viewModel.setMusicSourceFilter(it) },
+                        onTrackClick = { track -> viewModel.playTrack(track, listOf(track)) },
                         downloadProgress = downloadProgress,
                         downloadedTrackIds = downloadedTracks.map { it.id }.toSet(),
                         onDownloadTrack = { viewModel.requestDownloadTrack(it) },
-                        searchResults = searchResults,
-                        searchSuggestions = searchSuggestions,
-                        categorizedResults = categorizedSearchResults,
-                        isGlobalSearching = isGlobalSearching,
-                        globalTrendingTracks = globalTrendingTracks,
-                        onPlayTrack = { track, q -> viewModel.playTrack(track, q) },
-                        onToggleFavorite = { viewModel.toggleFavorite(it) }
+                        onToggleFavorite = { viewModel.toggleFavorite(it) },
+                        globalTrendingTracks = globalTrendingTracks
                     )
                     2 -> LibraryScreen(
                         tracks = tracks,

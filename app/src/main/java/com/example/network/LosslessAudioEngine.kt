@@ -5,6 +5,7 @@ import android.util.Log
 import com.example.model.AudioTrack
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -22,19 +23,18 @@ import java.util.concurrent.TimeUnit
  * - Strict Waterfall Priority Pipeline:
  *   Amazon Ultra HD -> Deezer HiFi -> Tidal HiFi -> JioSaavn 320k -> YouTube Music (Last Resort)
  * - Zero Fake Labels: Real container codecs and bitrates (e.g. 1411 kbps for 16/44.1 FLAC, 320 kbps AAC).
- * - Zero Blocking Modals: Silently cascades on regional 403 or geo-restrictions in milliseconds.
- * - Enforces StreamMatcher for 100% accurate audio matching (ISRC + strict ±3s duration check).
+ * - Non-blocking fail-safe timeouts so playback never stalls on unreachable endpoints.
  */
 object LosslessAudioEngine {
 
     private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(8, TimeUnit.SECONDS)
-        .readTimeout(8, TimeUnit.SECONDS)
+        .connectTimeout(2500, TimeUnit.MILLISECONDS)
+        .readTimeout(2500, TimeUnit.MILLISECONDS)
         .build()
 
     /**
      * Resolves stream candidates following the strict waterfall priority:
-     * Amazon Ultra HD -> Deezer HiFi -> Tidal HiFi -> JioSaavn 320k -> YouTube Music -> Offline Master
+     * Amazon Ultra HD -> Deezer HiFi -> Tidal HiFi -> JioSaavn 320k -> YouTube Music
      */
     suspend fun resolveLosslessWaterfall(
         context: Context,
@@ -43,59 +43,39 @@ object LosslessAudioEngine {
         val candidates = mutableListOf<ResolvedStreamCandidate>()
         val canonical = StreamMatcher.extractCanonicalMetadata(track)
 
-        // If ISRC is not attached to track, attempt quick canonical ISRC resolution
-        val effectiveCanonical = if (canonical.isrc.isNullOrBlank()) {
-            val resolvedIsrc = StreamMatcher.resolveIsrcIfMissing(canonical.title, canonical.artist)
-            canonical.copy(isrc = resolvedIsrc)
-        } else {
-            canonical
-        }
-
-        // 1. Tier 1: Amazon Music Ultra HD / HD (Up to 24-bit / 192kHz FLAC)
-        resolveAmazonUltraHd(effectiveCanonical)?.let {
-            candidates.add(it)
-        }
-
-        // 2. Tier 2: Deezer HiFi Lossless FLAC (16-bit / 44.1kHz 1411 kbps)
-        resolveDeezerHiFi(effectiveCanonical)?.let {
-            candidates.add(it)
-        }
-
-        // 3. Tier 3: Tidal HiFi / Master (24-bit / 96kHz or 16-bit / 44.1kHz FLAC)
-        resolveTidalHiFi(effectiveCanonical)?.let {
-            candidates.add(it)
-        }
-
-        // 4. Tier 4: JioSaavn (HQ 320kbps AAC - Clean Lossy Fallback with accurate labeling)
-        if (candidates.none { it.isLossless }) {
-            resolveJioSaavn320k(effectiveCanonical)?.let { saavnCandidate ->
+        // 1. Always resolve JioSaavn 320k HQ stream fast so a playable candidate is guaranteed
+        runCatching {
+            resolveJioSaavn320k(canonical)?.let { saavnCandidate ->
                 candidates.add(saavnCandidate)
             }
         }
 
-        // 5. Tier 5: YouTube Music (256k Opus / AAC - Last Resort Fallback)
-        if (candidates.isEmpty()) {
-            resolveYouTubeFallback(effectiveCanonical)?.let { ytCandidate ->
-                candidates.add(ytCandidate)
+        // 2. Attempt lossless tiers within a strict 1500ms budget so playback never stalls
+        withTimeoutOrNull(1500L) {
+            runCatching {
+                resolveDeezerHiFi(canonical)?.let { candidates.add(it) }
+            }
+            runCatching {
+                resolveAmazonUltraHd(canonical)?.let { candidates.add(it) }
+            }
+            runCatching {
+                resolveTidalHiFi(canonical)?.let { candidates.add(it) }
             }
         }
 
-        // If candidates exist, sort strictly by audiophile hierarchy:
-        // isLossless DESC -> bitDepth DESC -> sampleRate DESC -> bitrate DESC
+        // 3. Tier 5: YouTube Music (256k Opus / AAC - Last Resort Fallback) if JioSaavn had no match
+        if (candidates.isEmpty()) {
+            withTimeoutOrNull(2000L) {
+                runCatching {
+                    resolveYouTubeFallback(canonical)?.let { ytCandidate ->
+                        candidates.add(ytCandidate)
+                    }
+                }
+            }
+        }
+
         if (candidates.isNotEmpty()) {
             return@withContext UniversalStreamResolver.sortStreamCandidates(candidates)
-        }
-
-        // Under NO circumstance should synthetic PCM audio or silent mock frames be generated when a network stream fails.
-        // Fallback directly to genuine network streams: JioSaavn 320k -> YouTube Music
-        val saavnFallback = resolveJioSaavn320k(effectiveCanonical)
-        if (saavnFallback != null) {
-            return@withContext listOf(saavnFallback)
-        }
-
-        val ytFallback = resolveYouTubeFallback(effectiveCanonical)
-        if (ytFallback != null) {
-            return@withContext listOf(ytFallback)
         }
 
         emptyList()
@@ -109,8 +89,7 @@ object LosslessAudioEngine {
         return try {
             val encodedQuery = URLEncoder.encode("${canonical.title} ${canonical.artist}", "UTF-8")
             val endpoints = listOf(
-                "https://music.amazon.com/api/v1/stream/resolve?q=$encodedQuery&tier=ULTRA_HD&format=FLAC",
-                "https://api.spotiflac.io/v1/amazon/resolve?title=${URLEncoder.encode(canonical.title, "UTF-8")}&artist=${URLEncoder.encode(canonical.artist, "UTF-8")}"
+                "https://music.amazon.com/api/v1/stream/resolve?q=$encodedQuery&tier=ULTRA_HD&format=FLAC"
             )
 
             for (endpoint in endpoints) {
@@ -124,7 +103,6 @@ object LosslessAudioEngine {
                     val response = httpClient.newCall(request).execute()
                     if (!response.isSuccessful) {
                         response.close()
-                        // Silently cascade on 403 / geo-block
                         continue
                     }
                     val body = response.body?.string().orEmpty()
@@ -183,7 +161,6 @@ object LosslessAudioEngine {
      */
     fun resolveDeezerHiFi(canonical: StreamMatcher.CanonicalMetadata): ResolvedStreamCandidate? {
         return try {
-            // Step 1: Query by ISRC if available
             if (!canonical.isrc.isNullOrBlank()) {
                 val isrcUrl = "https://api.deezer.com/track/isrc:${canonical.isrc}"
                 val isrcReq = Request.Builder()
@@ -204,7 +181,6 @@ object LosslessAudioEngine {
                 }
             }
 
-            // Step 2: Query by strict track + artist search
             val cleanTitle = canonical.title
             val primaryArtist = canonical.artist
             val encoded = URLEncoder.encode("track:\"$cleanTitle\" artist:\"$primaryArtist\"", "UTF-8")
@@ -259,7 +235,6 @@ object LosslessAudioEngine {
 
         if (!isMatched) return null
 
-        // Direct FLAC stream url if present
         val directFlacUrl = item.optString("flac_stream_url", "")
         if (directFlacUrl.isNotBlank() && UniversalStreamResolver.isFullLengthStreamUrl(directFlacUrl)) {
             return ResolvedStreamCandidate(
@@ -275,7 +250,6 @@ object LosslessAudioEngine {
             )
         }
 
-        // Obtain FLAC stream token via Deezer media API
         val trackToken = item.optString("track_token", "")
         if (trackToken.isNotBlank()) {
             val mediaPayload = JSONObject().apply {

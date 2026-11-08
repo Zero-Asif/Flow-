@@ -1,8 +1,11 @@
 package com.example.ui.components
 
 import androidx.activity.compose.BackHandler
+import androidx.compose.ui.platform.LocalContext
 import coil.compose.AsyncImage
+import coil.request.ImageRequest
 import androidx.compose.ui.layout.ContentScale
+import com.example.util.AlbumArtHelper
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.RepeatMode as AnimRepeatMode
@@ -264,14 +267,20 @@ fun NowPlayingSheet(
 
             Spacer(modifier = Modifier.height(6.dp))
 
-            // Full Song Stream Provider Badge (Click to cycle real stream candidates: [Deezer HiFi FLAC], [Amazon Ultra HD], [Tidal Master], [JioSaavn 320k])
-            val rawStream = activeStreamCandidateName?.takeIf { it.isNotBlank() }
-                ?: track.sourceProvider.takeIf { it.isNotBlank() }
-                ?: streamBackend.label
+            // Full Song Stream Provider Badge (Dynamically reflects real probed codec & bitrate)
+            val probedCodec = audioQualityInfo.formatName.takeIf { it.isNotBlank() && it != "PROBING" }
+                ?: track.format.displayName
+            val probedBitrate = audioQualityInfo.bitrateKbps.takeIf { it > 0 }
+                ?: track.bitrateKbps
+            val dynamicProbedStreamLabel = if (probedBitrate > 0) {
+                "$probedBitrate kbps $probedCodec"
+            } else {
+                activeStreamCandidateName?.takeIf { it.isNotBlank() } ?: streamBackend.label
+            }
             val displayedStream = when {
-                rawStream.startsWith("Stream:", ignoreCase = true) -> rawStream
-                rawStream.startsWith("[") && rawStream.endsWith("]") -> "Stream: $rawStream"
-                else -> "Stream: [$rawStream]"
+                dynamicProbedStreamLabel.startsWith("Stream:", ignoreCase = true) -> dynamicProbedStreamLabel
+                dynamicProbedStreamLabel.startsWith("[") && dynamicProbedStreamLabel.endsWith("]") -> "Stream: $dynamicProbedStreamLabel"
+                else -> "Stream: [$dynamicProbedStreamLabel]"
             }
             Row(
                 verticalAlignment = Alignment.CenterVertically,
@@ -341,8 +350,14 @@ fun NowPlayingSheet(
                             contentAlignment = Alignment.Center
                         ) {
                             if (!track.artworkUrl.isNullOrBlank()) {
+                                val context = LocalContext.current
                                 AsyncImage(
-                                    model = track.artworkUrl,
+                                    model = ImageRequest.Builder(context)
+                                        .data(AlbumArtHelper.enhanceArtworkUrl(track.artworkUrl))
+                                        .memoryCacheKey(track.id)
+                                        .diskCacheKey(track.id)
+                                        .crossfade(true)
+                                        .build(),
                                     contentDescription = track.title,
                                     contentScale = ContentScale.Crop,
                                     modifier = Modifier
@@ -707,12 +722,24 @@ private fun LyricsView(
     val listState = rememberLazyListState()
 
     val activeIndex = syncState.activeLineIndex
+    val resetTrigger = syncState.scrollResetTrigger
 
-    LaunchedEffect(activeIndex) {
-        if (activeIndex >= 0) {
-            val viewportHeight = listState.layoutInfo.viewportSize.height
-            val centerOffset = if (viewportHeight > 0) -(viewportHeight / 3) else -280
-            listState.animateScrollToItem(index = activeIndex, scrollOffset = centerOffset)
+    // Step 3.3: Whenever currentTrack changes, immediately reset scroll offset to 0
+    LaunchedEffect(resetTrigger) {
+        listState.scrollToItem(index = 0, scrollOffset = 0)
+    }
+
+    LaunchedEffect(activeIndex, lyrics.size) {
+        if (lyrics.isEmpty()) {
+            listState.scrollToItem(index = 0, scrollOffset = 0)
+        } else if (activeIndex in lyrics.indices) {
+            if (activeIndex == 0 && currentPositionMs < 1500L) {
+                listState.scrollToItem(index = 0, scrollOffset = 0)
+            } else {
+                val viewportHeight = listState.layoutInfo.viewportSize.height
+                val centerOffset = if (viewportHeight > 0) -(viewportHeight / 3) else -280
+                listState.animateScrollToItem(index = activeIndex, scrollOffset = centerOffset)
+            }
         }
     }
 
@@ -819,9 +846,10 @@ private fun LyricsView(
                     )
                     Spacer(modifier = Modifier.height(10.dp))
                     Text(
-                        text = "Fetching live synchronized lyrics from LRCLIB...",
+                        text = "No synchronized lyrics available",
                         color = TextSecondaryDark,
                         fontSize = 13.sp,
+                        fontWeight = FontWeight.Medium,
                         textAlign = TextAlign.Center
                     )
                 }

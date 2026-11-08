@@ -8,6 +8,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.audio.ExoPlayerAudioEngine
 import com.example.data.MusicRepository
+import com.example.download.SongDownloadManager
 import com.example.model.AudioFormat
 import com.example.model.AudioQualityInfo
 import com.example.model.AudioTrack
@@ -15,15 +16,21 @@ import com.example.model.BadgeDisplayMode
 import com.example.model.EqualizerPreset
 import com.example.model.FlowMood
 import com.example.model.KaraokeLyricLine
-import com.example.model.ListeningStats
 import com.example.model.LyricsDisplayMode
 import com.example.model.PlaybackState
-import com.example.model.Playlist
 import com.example.model.RepeatMode
 import com.example.model.StreamBackend
+import com.example.network.DownloadQualityOption
+import com.example.network.GlobalMusicSearchEngine
+import com.example.network.LyricsRepository
+import com.example.network.ResolvedStreamCandidate
+import com.example.network.TopResultItem
+import com.example.network.TrackRadioRepository
 import com.example.service.FlowPlaybackService
+import com.example.ui.viewmodel.SearchUiState
 import com.example.util.LyricsSyncState
 import com.example.util.StateDrivenLyricsParser
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -36,19 +43,11 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
-import com.example.download.SongDownloadManager
-import com.example.network.CategorizedSearchResults
-import com.example.network.ResolvedStreamCandidate
-import com.example.network.DownloadQualityOption
-import com.example.network.GlobalMusicSearchEngine
-import com.example.network.MusicSourceFilter
-import com.example.network.SearchSuggestionsResult
-import com.example.network.TrackRadioRepository
-
 class MusicViewModel(application: Application) : AndroidViewModel(application) {
     val repository = MusicRepository(application.applicationContext)
     val audioEngine = ExoPlayerAudioEngine.getInstance(application.applicationContext)
     val downloadManager = SongDownloadManager.getInstance(application.applicationContext, repository)
+    private val searchEngine = GlobalMusicSearchEngine()
 
     // Download states
     val downloadProgress: StateFlow<Map<String, Float>> = downloadManager.downloadProgress
@@ -58,12 +57,17 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     private val _pendingDownloadTrack = MutableStateFlow<AudioTrack?>(null)
     val pendingDownloadTrack: StateFlow<AudioTrack?> = _pendingDownloadTrack.asStateFlow()
 
-    // SpotiFLAC multi-source search filter
-    val selectedMusicSourceFilter = MutableStateFlow(MusicSourceFilter.ALL)
-
     // Playback state
     private val _playbackState = MutableStateFlow(PlaybackState())
     val playbackState: StateFlow<PlaybackState> = _playbackState.asStateFlow()
+
+    // Dedicated 50ms high-frequency playback position StateFlow for lock-step lyrics synchronization
+    private val _currentPositionMs = MutableStateFlow(0L)
+    val currentPositionMs: StateFlow<Long> = _currentPositionMs.asStateFlow()
+
+    // Scroll reset counter incremented every time currentTrack changes so Lyrics UI resets scroll offset to 0
+    private val _lyricsScrollResetTrigger = MutableStateFlow(0L)
+    val lyricsScrollResetTrigger: StateFlow<Long> = _lyricsScrollResetTrigger.asStateFlow()
 
     // Atomic track loading & stream resolution error states
     val isLoadingTrack: StateFlow<Boolean> = audioEngine.isLoadingTrack
@@ -106,12 +110,24 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     private val _activeLyrics = MutableStateFlow<List<KaraokeLyricLine>>(emptyList())
     val activeLyrics: StateFlow<List<KaraokeLyricLine>> = _activeLyrics.asStateFlow()
 
-    // State-driven synced lyrics engine combining raw LRC and ExoPlayer position
+    // Step 3.2: State-driven synced lyrics engine with +200ms vocal lead compensation and scroll reset trigger
     val lyricsSyncState: StateFlow<LyricsSyncState> = combine(
         _activeLyrics,
-        _playbackState
-    ) { lyrics, playback ->
-        StateDrivenLyricsParser.sync(lyrics, playback.currentPositionMs)
+        _currentPositionMs,
+        _lyricsScrollResetTrigger
+    ) { lyricsList, posMs, resetTrigger ->
+        val synced = StateDrivenLyricsParser.sync(lyricsList, posMs)
+        val targetPosition = posMs + 200L
+        val activeLineIndex = if (lyricsList.isEmpty()) {
+            -1
+        } else {
+            lyricsList.indexOfLast { it.startTimeMs <= targetPosition }.coerceAtLeast(0)
+        }
+        synced.copy(
+            activeLineIndex = activeLineIndex,
+            activeLine = if (activeLineIndex in lyricsList.indices) lyricsList[activeLineIndex] else null,
+            scrollResetTrigger = resetTrigger
+        )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), LyricsSyncState())
 
     private val _lyricsDisplayMode = MutableStateFlow(LyricsDisplayMode.LINE_GLOW)
@@ -128,17 +144,23 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     private val _selectedStreamBackend = MutableStateFlow(StreamBackend.AUTO_HIGH_FIDELITY)
     val selectedStreamBackend: StateFlow<StreamBackend> = _selectedStreamBackend.asStateFlow()
 
-    // Real candidate stream switching (Deezer HiFi FLAC, Amazon Ultra HD, Tidal Master, JioSaavn 320k)
+    // Real candidate stream switching
     val activeStreamCandidate: StateFlow<ResolvedStreamCandidate?> = audioEngine.activeStreamCandidate
     val availableStreamCandidates: StateFlow<List<ResolvedStreamCandidate>> = audioEngine.availableStreamCandidates
 
     private var lyricsJob: Job? = null
+    private var lyricsPositionPollerJob: Job? = null
+    private var lastObservedTrackId: String? = null
 
     // Search filters
     val searchQuery = MutableStateFlow("")
     val filterGenre = MutableStateFlow<String?>(null)
     val filterFormat = MutableStateFlow<AudioFormat?>(null)
     val filterYear = MutableStateFlow<Int?>(null)
+
+    // Structured Search UI state
+    private val _searchUiState = MutableStateFlow(SearchUiState())
+    val searchUiState: StateFlow<SearchUiState> = _searchUiState.asStateFlow()
 
     // Global Music Search Engine states
     private val _globalSearchResults = MutableStateFlow<List<AudioTrack>>(emptyList())
@@ -149,9 +171,6 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _globalTrendingTracks = MutableStateFlow<List<AudioTrack>>(emptyList())
     val globalTrendingTracks: StateFlow<List<AudioTrack>> = _globalTrendingTracks.asStateFlow()
-
-    private val _searchSuggestions = MutableStateFlow(SearchSuggestionsResult())
-    val searchSuggestions: StateFlow<SearchSuggestionsResult> = _searchSuggestions.asStateFlow()
 
     private var searchJob: Job? = null
     private var isRadioMode: Boolean = true
@@ -169,14 +188,12 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             val matchingLocal = localTracks.filter { track ->
                 track.title.contains(trimmedQuery, ignoreCase = true) ||
                     track.artist.contains(trimmedQuery, ignoreCase = true) ||
-                    track.album.contains(trimmedQuery, ignoreCase = true) ||
-                    GlobalMusicSearchEngine.computeSearchRelevanceScore(track, trimmedQuery) >= 62
+                    track.album.contains(trimmedQuery, ignoreCase = true)
             }
             val deduplicatedGlobal = globalTracks.filter { gTrack ->
                 matchingLocal.none { it.id == gTrack.id }
             }
-            // Rank combined results by Fuzzy Relevance Score + Lossless Quality Cascade
-            GlobalMusicSearchEngine.rankTracksByQueryAndQuality(matchingLocal + deduplicatedGlobal, trimmedQuery)
+            deduplicatedGlobal + matchingLocal
         } else {
             localTracks
         }
@@ -196,24 +213,20 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         }
     }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
-    val categorizedSearchResults: StateFlow<CategorizedSearchResults> = combine(
-        searchResults,
-        searchQuery
-    ) { results, query ->
-        if (query.isNotBlank()) {
-            GlobalMusicSearchEngine.segregateSearchResults(results, query)
-        } else {
-            CategorizedSearchResults()
-        }
-    }.stateIn(viewModelScope, SharingStarted.Eagerly, CategorizedSearchResults())
-
     private var sleepTimerJob: Job? = null
 
     init {
-        // 1. Subscribe to SSOT Track Transition state (emitted only after ExoPlayer queues & prepares resolved stream)
+        // 1. Subscribe to SSOT Track Transition state
         viewModelScope.launch {
             audioEngine.currentTrackState.collectLatest { track ->
                 if (track != null) {
+                    val trackChanged = lastObservedTrackId != track.id
+                    if (trackChanged) {
+                        lastObservedTrackId = track.id
+                        // Step 3.3: Whenever currentTrack changes, immediately clear active lyrics and reset scroll offset to 0
+                        resetLyricsStateForNewTrack()
+                    }
+
                     val currentQueue = audioEngine.activeQueue.ifEmpty { _playbackState.value.queue }
                     val updatedQueue = if (currentQueue.any { it.id == track.id }) {
                         currentQueue.map { if (it.id == track.id) track else it }
@@ -225,7 +238,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                         currentTrack = track,
                         queue = updatedQueue,
                         queueIndex = newIdx,
-                        currentPositionMs = 0L,
+                        currentPositionMs = if (trackChanged) 0L else _playbackState.value.currentPositionMs,
                         durationMs = if (track.durationMs > 0) track.durationMs else _playbackState.value.durationMs
                     )
                     repository.saveLastPlayedTrack(track)
@@ -235,16 +248,22 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
-        // 2. Subscribe to SSOT Play/Pause state
+        // 2. Subscribe to SSOT Play/Pause state and start/stop 50ms high-precision lyrics position poller
         viewModelScope.launch {
             audioEngine.isPlayingState.collectLatest { isPlaying ->
                 _playbackState.value = _playbackState.value.copy(isPlaying = isPlaying)
+                if (isPlaying) {
+                    startHighFrequencyLyricsPoller()
+                } else {
+                    lyricsPositionPollerJob?.cancel()
+                }
             }
         }
 
         // 3. Subscribe to SSOT Playback Position and Duration
         viewModelScope.launch {
             audioEngine.currentPositionState.collectLatest { pos ->
+                _currentPositionMs.value = pos
                 _playbackState.value = _playbackState.value.copy(currentPositionMs = pos)
             }
         }
@@ -281,13 +300,14 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         audioEngine.setEqualizerPreset(_activePreset.value)
         audioEngine.setGaplessEnabled(true)
 
-        // Hydrate MiniPlayer from persisted lastPlayedTrack (or active engine track / history), NEVER hardcoding "Midnight Horizon"
+        // Hydrate MiniPlayer from persisted lastPlayedTrack (or active engine track / history)
         val initialTracks = repository.tracks.value
         val restoredTrack = audioEngine.currentPlayingTrack
             ?: repository.loadLastPlayedTrack()
             ?: repository.history.value.firstOrNull()
 
         if (restoredTrack != null) {
+            lastObservedTrackId = restoredTrack.id
             val restoredQueue = if (initialTracks.any { it.id == restoredTrack.id }) {
                 initialTracks.map { if (it.id == restoredTrack.id) restoredTrack else it }
             } else {
@@ -295,13 +315,15 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             }
             val restoredIndex = restoredQueue.indexOfFirst { it.id == restoredTrack.id }.coerceAtLeast(0)
             val isCurrentlyPlaying = audioEngine.exoPlayer.isPlaying
+            val initialPos = if (isCurrentlyPlaying) audioEngine.exoPlayer.currentPosition.coerceAtLeast(0L) else 0L
 
+            _currentPositionMs.value = initialPos
             _playbackState.value = _playbackState.value.copy(
                 queue = restoredQueue,
                 queueIndex = restoredIndex,
                 currentTrack = restoredTrack,
                 isPlaying = isCurrentlyPlaying,
-                currentPositionMs = if (isCurrentlyPlaying) audioEngine.exoPlayer.currentPosition.coerceAtLeast(0L) else 0L,
+                currentPositionMs = initialPos,
                 durationMs = restoredTrack.durationMs
             )
             _audioQualityInfo.value = AudioQualityInfo(
@@ -314,8 +336,10 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                 isHiRes = restoredTrack.format.isLossless || restoredTrack.sampleRate >= 96000 || restoredTrack.bitDepth >= 24
             )
             fetchLyricsForTrack(restoredTrack)
+            if (isCurrentlyPlaying) {
+                startHighFrequencyLyricsPoller()
+            }
         } else {
-            // No play history exists yet: keep currentTrack = null so MiniPlayer gracefully hides until a song is played
             _playbackState.value = _playbackState.value.copy(
                 queue = initialTracks,
                 queueIndex = 0,
@@ -329,72 +353,113 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         // Fetch initial trending global hits
         viewModelScope.launch {
             try {
-                val trending = GlobalMusicSearchEngine.getGlobalTrendingTracks()
-                _globalTrendingTracks.value = trending
+                searchEngine.searchStructured("Global Top Hits").onSuccess { shelves ->
+                    val topSong = (shelves.topResult as? TopResultItem.SongItem)?.track
+                    val combined = if (topSong != null) listOf(topSong) + shelves.songs else shelves.songs
+                    _globalTrendingTracks.value = combined.distinctBy { it.id }
+                }
             } catch (e: Exception) {
                 e.printStackTrace()
             }
         }
     }
 
-    fun setMusicSourceFilter(filter: MusicSourceFilter) {
-        selectedMusicSourceFilter.value = filter
-        val currentQuery = searchQuery.value.trim()
-        if (currentQuery.isNotEmpty()) {
-            executeSearch(currentQuery, filter)
+    /**
+     * Step 3.1: High-Frequency Polling (50ms) while playing so that lyrics highlighting keeps lock-step with vocals.
+     */
+    private fun startHighFrequencyLyricsPoller() {
+        lyricsPositionPollerJob?.cancel()
+        lyricsPositionPollerJob = viewModelScope.launch {
+            while (isActive && _playbackState.value.isPlaying) {
+                val pos = audioEngine.exoPlayer.currentPosition.coerceAtLeast(0L)
+                _currentPositionMs.value = pos
+                _playbackState.value = _playbackState.value.copy(currentPositionMs = pos)
+                delay(50L)
+            }
         }
     }
 
     /**
-     * Debounced Search State Manager (250ms debounce per Module 2.1):
-     * - Cancels any in-flight OkHttp API calls and active search coroutine immediately.
-     * - Clears stale global search list state so old results never linger or desync.
+     * Step 3.3: State Reset — Immediately clears active lyrics, resets position to 0, and triggers scroll offset reset to 0.
+     */
+    private fun resetLyricsStateForNewTrack() {
+        lyricsJob?.cancel()
+        LyricsRepository.cancelActiveLyricsRequests()
+        currentLyricsTrackId = null
+        _activeLyrics.value = emptyList()
+        _currentPositionMs.value = 0L
+        _lyricsScrollResetTrigger.value = _lyricsScrollResetTrigger.value + 1L
+    }
+
+    /**
+     * Debounced Search State Manager:
+     * - Cancels any in-flight OkHttp API calls via suspendCancellableCoroutine when searchJob is cancelled.
+     * - Updates structured SearchUiState with Result<SearchResultShelves>.
      */
     fun onSearchQueryChanged(newQuery: String) {
         searchQuery.value = newQuery
         searchJob?.cancel()
-        GlobalMusicSearchEngine.cancelActiveSearchCalls()
 
         val trimmed = newQuery.trim()
         if (trimmed.isEmpty()) {
             _globalSearchResults.value = emptyList()
-            _searchSuggestions.value = SearchSuggestionsResult()
             _isGlobalSearching.value = false
+            _searchUiState.value = SearchUiState()
             return
         }
 
-        // Immediately clear previous search results & mark loading before debounce fires
-        _globalSearchResults.value = emptyList()
         _isGlobalSearching.value = true
-        executeSearch(trimmed, selectedMusicSourceFilter.value)
+        _searchUiState.value = _searchUiState.value.copy(isLoading = true, errorMessage = null)
+        executeSearch(trimmed)
     }
 
-    private fun executeSearch(query: String, filter: MusicSourceFilter) {
+    fun retrySearch() {
+        val trimmed = searchQuery.value.trim()
+        if (trimmed.isNotEmpty()) {
+            executeSearch(trimmed)
+        }
+    }
+
+    private fun executeSearch(query: String) {
         searchJob?.cancel()
-        GlobalMusicSearchEngine.cancelActiveSearchCalls()
 
         searchJob = viewModelScope.launch {
             _isGlobalSearching.value = true
-            _globalSearchResults.value = emptyList()
-            // 250ms debounce window per Amazon / YouTube Music typeahead specification
-            delay(250L)
+            _searchUiState.value = _searchUiState.value.copy(isLoading = true, errorMessage = null)
+            delay(280L)
             if (!isActive) return@launch
             try {
-                val results = GlobalMusicSearchEngine.searchAllSources(
-                    query = query,
-                    filter = filter
-                )
-                if (isActive && searchQuery.value.trim().equals(query.trim(), ignoreCase = true)) {
-                    _globalSearchResults.value = results
-                    val suggestions = GlobalMusicSearchEngine.fetchAutocompleteSuggestions(query, results)
-                    if (isActive) {
-                        _searchSuggestions.value = suggestions
+                val result = searchEngine.searchStructured(query)
+                result.fold(
+                    onSuccess = { shelves ->
+                        val topSong = (shelves.topResult as? TopResultItem.SongItem)?.track
+                        val allSongs = if (topSong != null) listOf(topSong) + shelves.songs else shelves.songs
+                        _globalSearchResults.value = allSongs.distinctBy { it.id }
+                        _searchUiState.value = SearchUiState(
+                            isLoading = false,
+                            topResult = shelves.topResult,
+                            songs = shelves.songs,
+                            artists = shelves.artists,
+                            albums = shelves.albums,
+                            playlists = shelves.playlists,
+                            errorMessage = null
+                        )
+                    },
+                    onFailure = { exception ->
+                        if (exception is CancellationException) throw exception
+                        _searchUiState.value = _searchUiState.value.copy(
+                            isLoading = false,
+                            errorMessage = exception.localizedMessage ?: "Failed to load results"
+                        )
                     }
-                }
-            } catch (e: kotlinx.coroutines.CancellationException) {
+                )
+            } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                e.printStackTrace()
+                _searchUiState.value = _searchUiState.value.copy(
+                    isLoading = false,
+                    errorMessage = e.localizedMessage ?: "Failed to load results"
+                )
             } finally {
                 if (isActive) {
                     _isGlobalSearching.value = false
@@ -463,22 +528,28 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             listOf(track) + baseQueue
         }
 
-        // Immediately reflect stopped/reset state while engine halts previous stream and prepares new URI.
-        // Do NOT update currentTrack or mini-player state until audioEngine confirms STATE_READY for the new track URL.
+        // Step 3.3: Immediately clear active lyrics and reset scroll offset to 0 on track change
+        lastObservedTrackId = track.id
+        resetLyricsStateForNewTrack()
+
+        // Immediately update currentTrack in MusicViewModel (<50ms) so the mini-player and NowPlaying screen
+        // reflect the newly tapped song right away while ExoPlayer buffers the verified stream.
+        val targetIdx = newQueue.indexOfFirst { it.id == track.id }.coerceAtLeast(0)
         _playbackState.value = _playbackState.value.copy(
+            currentTrack = track,
             isPlaying = false,
             currentPositionMs = 0L,
+            durationMs = track.durationMs,
             queue = newQueue,
-            queueIndex = 0
+            queueIndex = targetIdx
         )
+        repository.saveLastPlayedTrack(track)
+        fetchLyricsForTrack(track)
 
-        // Delegate atomic stop -> reset -> resolve highest bitrate -> STATE_READY -> emit UI state -> play
+        // Delegate atomic stop -> reset -> resolve highest bitrate via MultiProviderStreamResolver -> play
         audioEngine.playTrack(track, newQueue, _selectedStreamBackend.value)
 
-        // Smart Dynamic Track Radio Generation:
-        // When played as a standalone seed track from search, do NOT feed the remaining search results.
-        // Instead, asynchronously populate "Up Next" with 15-20 contextually related songs
-        // (similar artists, tempo, genre) — strictly excluding duplicate titles or remixes of the seed track!
+        // Smart Dynamic Track Radio Generation
         if (isSingleSelection) {
             radioJob?.cancel()
             radioJob = viewModelScope.launch {
@@ -545,11 +616,9 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         if (track == null && current.queue.isNotEmpty()) {
             playTrack(current.queue.first(), current.queue)
         } else if (track != null && audioEngine.exoPlayer.mediaItemCount == 0) {
-            // Hydrated lastPlayedTrack from storage: load and play it on first tap
             playTrack(track, current.queue)
         } else {
             ensureServiceStarted()
-            // Immediate reactive UI update for zero tap lag
             val nextPlayState = !current.isPlaying
             _playbackState.value = _playbackState.value.copy(isPlaying = nextPlayState)
             audioEngine.togglePlayPause()
@@ -559,20 +628,31 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     private var currentLyricsTrackId: String? = null
 
     fun fetchLyricsForTrack(track: AudioTrack) {
-        if (currentLyricsTrackId == track.id && lyricsJob?.isActive == true) {
+        val targetId = track.id
+        if (currentLyricsTrackId == targetId && (lyricsJob?.isActive == true || _activeLyrics.value.isNotEmpty())) {
             return
         }
-        currentLyricsTrackId = track.id
+        currentLyricsTrackId = targetId
         lyricsJob?.cancel()
+        LyricsRepository.cancelActiveLyricsRequests()
+        _activeLyrics.value = emptyList()
+        _lyricsScrollResetTrigger.value = _lyricsScrollResetTrigger.value + 1L
+
         lyricsJob = viewModelScope.launch {
             try {
-                val lyrics = com.example.network.LyricsRepository.getSyncedLyrics(
+                val lyrics = LyricsRepository.getSyncedLyrics(
                     trackTitle = track.title,
                     artistName = track.artist,
                     albumName = track.album,
-                    durationSeconds = track.durationMs / 1000L
+                    durationSeconds = (track.durationMs / 1000L).coerceAtLeast(0L)
                 )
-                _activeLyrics.value = lyrics
+                // Only apply if this track is still the active bound track
+                if (isActive && currentLyricsTrackId == targetId) {
+                    _activeLyrics.value = lyrics
+                    _lyricsScrollResetTrigger.value = _lyricsScrollResetTrigger.value + 1L
+                }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 e.printStackTrace()
             }
@@ -631,6 +711,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     fun seekTo(positionMs: Long) {
         audioEngine.seekTo(positionMs)
+        _currentPositionMs.value = positionMs
         _playbackState.value = _playbackState.value.copy(currentPositionMs = positionMs)
     }
 
@@ -721,14 +802,12 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                 remaining--
                 _playbackState.value = _playbackState.value.copy(sleepTimerSecondsRemaining = remaining)
 
-                // Fade out in last 30 seconds for gentle audiophile sleep
                 if (remaining <= 30) {
                     val fadeVol = (remaining / 30f).coerceIn(0f, 1f)
                     audioEngine.setMasterVolume(fadeVol)
                 }
             }
 
-            // Time's up: pause playback
             audioEngine.togglePlayPause()
             audioEngine.setMasterVolume(1.0f)
             _playbackState.value = _playbackState.value.copy(
@@ -785,6 +864,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     override fun onCleared() {
         super.onCleared()
+        lyricsPositionPollerJob?.cancel()
         if (!audioEngine.exoPlayer.isPlaying) {
             audioEngine.release()
         }

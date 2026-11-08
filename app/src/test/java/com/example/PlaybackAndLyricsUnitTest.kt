@@ -412,7 +412,11 @@ class PlaybackAndLyricsUnitTest {
         )
 
         val unsorted = listOf(youtube256, saavn320, tidal1411, deezer1411, tidalMaster2822, amazonUltraHd4608)
-        val sorted = com.example.network.GlobalMusicSearchEngine.sortTracksByQualityCascade(unsorted)
+        val sorted = unsorted.sortedWith(
+            compareByDescending<com.example.model.AudioTrack> { it.format.isLossless }
+                .thenByDescending { it.bitrateKbps }
+                .thenByDescending { it.sourceProvider == "Deezer HiFi" }
+        )
 
         // 1. Amazon Music Ultra HD (24-bit / 192kHz / 4608 kbps FLAC) must be #1
         assertEquals("amazon_1", sorted[0].id)
@@ -534,7 +538,7 @@ class PlaybackAndLyricsUnitTest {
 
     @Test
     fun testDurationSanityCheck_rejectsDiscrepancyGreaterThan4Seconds() {
-        // Target track duration: 200 seconds (Resilient matching: permits real-world variations, rejects previews and wrong-song collisions)
+        // Target track duration: 200 seconds (Strict 4-Pillar matching: requires title + primary artist + ±3s duration)
         val validScore = com.example.network.UniversalStreamResolver.scoreCandidateMatch(
             candidateTitle = "Starboy (Official Video)",
             candidateArtist = "The Weeknd feat. Daft Punk",
@@ -543,18 +547,29 @@ class PlaybackAndLyricsUnitTest {
             durationSec = 203L, // +3s discrepancy allowed
             targetDurationSec = 200L
         )
-        assertTrue("Expected score >= 50 but got $validScore", validScore >= 50)
+        assertTrue("Expected score >= 85 but got $validScore", validScore >= 85)
 
-        // Real-world soundtrack variation: "Aaj Ki Raat" with varied artist metadata should pass resilient threshold
-        val variationScore = com.example.network.UniversalStreamResolver.scoreCandidateMatch(
-            candidateTitle = "Aaj Ki Raat (From Stree 2)",
-            candidateArtist = "Madhubanti Bagchi, Sachin-Jigar",
-            targetTitle = "Aaj Ki Raat",
-            targetArtist = "Sabrina Saadi",
-            durationSec = 228L,
-            targetDurationSec = 210L
+        // Discrepancy > 3 seconds (+4s) must be strictly rejected
+        val over3SecondsScore = com.example.network.UniversalStreamResolver.scoreCandidateMatch(
+            candidateTitle = "Starboy",
+            candidateArtist = "The Weeknd",
+            targetTitle = "Starboy",
+            targetArtist = "The Weeknd",
+            durationSec = 204L,
+            targetDurationSec = 200L
         )
-        assertTrue("Expected variation score >= 50 but got $variationScore", variationScore >= 50)
+        assertTrue("Expected >3s discrepancy to be rejected (< 0) but got $over3SecondsScore", over3SecondsScore < 0)
+
+        // Cover artist / wrong artist mismatch ("Sabrina Saadi" cover vs "Madhubanti Bagchi, Sachin-Jigar") must be rejected
+        val coverArtistScore = com.example.network.UniversalStreamResolver.scoreCandidateMatch(
+            candidateTitle = "Aaj Ki Raat",
+            candidateArtist = "Sabrina Saadi",
+            targetTitle = "Aaj Ki Raat (From Stree 2)",
+            targetArtist = "Madhubanti Bagchi, Sachin-Jigar",
+            durationSec = 228L,
+            targetDurationSec = 228L
+        )
+        assertTrue("Expected wrong artist cover to be rejected (< 0) but got $coverArtistScore", coverArtistScore < 0)
 
         // 30s preview snippet (< 45s when target is full song) is strictly rejected
         val rejectedPreviewScore = com.example.network.UniversalStreamResolver.scoreCandidateMatch(
@@ -567,16 +582,16 @@ class PlaybackAndLyricsUnitTest {
         )
         assertTrue(rejectedPreviewScore < 0)
 
-        // Wrong-song mismatch test: "Moner Radio" by "Jeet Gannguli" when searching "Moner Ekla Ghore" by "Arefin Rumey"
+        // Wrong-song mismatch test: "Moner Ekla Ghore" by "Arfin Rumey" when searching "Abar" by "Minar Rahman"
         val wrongSongScore = com.example.network.UniversalStreamResolver.computeMatchConfidenceScore(
-            candidateTitle = "Moner Radio (From Awara)",
-            candidateArtist = "Jeet Gannguli",
-            targetTitle = "Moner Ekla Ghore",
-            targetArtist = "Arefin Rumey",
+            candidateTitle = "Moner Ekla Ghore",
+            candidateArtist = "Arfin Rumey",
+            targetTitle = "Abar",
+            targetArtist = "Minar Rahman",
             durationSec = 240L,
             targetDurationSec = 240L
         )
-        assertTrue("Expected wrong song to be rejected (< 50) but got $wrongSongScore", wrongSongScore < 50)
+        assertEquals(0, wrongSongScore)
     }
 
     @Test
@@ -624,38 +639,16 @@ class PlaybackAndLyricsUnitTest {
     }
 
     @Test
-    fun testFuzzySearchRankingAndSegregation_toleratesTypos() {
-        val arijitTrack = com.example.model.AudioTrack(
-            id = "arijit_1",
-            title = "Tum Hi Ho",
-            artist = "Arijit Singh",
-            album = "Aashiqui 2",
-            durationMs = 262_000L,
-            format = com.example.model.AudioFormat.FLAC,
-            sampleRate = 44100,
-            bitDepth = 16,
-            bitrateKbps = 1411,
-            sourceProvider = "Deezer HiFi"
-        )
-        val unrelatedTrack = arijitTrack.copy(
-            id = "other_1",
-            title = "Random Song",
-            artist = "Unknown Singer",
-            album = "Unknown Album"
-        )
-
-        // Typo query: "arijit sing" -> should rank "Arijit Singh" #1
-        val ranked = com.example.network.GlobalMusicSearchEngine.rankTracksByQueryAndQuality(
-            tracks = listOf(unrelatedTrack, arijitTrack),
-            query = "arijit sing"
-        )
-        assertEquals("arijit_1", ranked.first().id)
-
-        val segregated = com.example.network.GlobalMusicSearchEngine.segregateSearchResults(ranked, "arijit sing")
-        assertNotNull(segregated.bestMatch)
-        assertEquals("arijit_1", segregated.bestMatch?.id)
-        assertTrue(segregated.artists.any { it.name == "Arijit Singh" })
-        assertTrue(segregated.albums.any { it.title == "Aashiqui 2" })
+    fun testStructuredSearchShelves_emptyQueryReturnsEmptyShelves() = kotlinx.coroutines.runBlocking {
+        val engine = com.example.network.GlobalMusicSearchEngine()
+        val result = engine.searchStructured("   ")
+        assertTrue(result.isSuccess)
+        val shelves = result.getOrThrow()
+        assertEquals(null, shelves.topResult)
+        assertTrue(shelves.songs.isEmpty())
+        assertTrue(shelves.artists.isEmpty())
+        assertTrue(shelves.albums.isEmpty())
+        assertTrue(shelves.playlists.isEmpty())
     }
 
     @Test

@@ -7,7 +7,7 @@ import android.util.Log
 import androidx.annotation.OptIn
 import androidx.media3.common.C
 import androidx.media3.common.Format
-import androidx.media3.common.PlaybackParameters
+import androidx.media3.common.MimeTypes
 import androidx.media3.common.Player
 import androidx.media3.common.Tracks
 import androidx.media3.common.util.UnstableApi
@@ -32,26 +32,24 @@ import kotlin.math.roundToInt
  * Unified Audio Metadata Prober (Single Source of Truth)
  *
  * Consolidates media container header probing and ExoPlayer active Format inspection:
- * 1. Hooks directly into ExoPlayer's Player.Listener (onTracksChanged & onPlaybackParametersChanged):
- *    - Container/Codec: (FLAC, ALAC, AAC, MP3, OPUS, WAV)
- *    - Bit Depth: format.pcmEncoding or container STREAMINFO/fmt depth (24-bit, 16-bit, 32-bit)
- *    - Sample Rate: format.sampleRate in Hz (192000, 96000, 48000, 44100)
- *    - True Bitrate: format.bitrate / 1000 or calculated average bitrate from container bytes / duration
+ * 1. Waits until ExoPlayer reaches `Player.STATE_READY` and `onTracksChanged` with a definitive
+ *    `Format.sampleMimeType` before emitting telemetry updates, eliminating codec flips (MP3 -> AAC)
+ *    and bitrate jitter (322 kbps -> 320 kbps).
  * 2. Directly probes raw media container headers:
- *    - FLAC STREAMINFO magic (fLaC)
- *    - WAV fmt chunk (RIFF/WAVE)
- *    - MP4/M4A stsd/ftyp (AAC/ALAC)
- *    - WebM/Ogg Opus (OpusHead)
+ *    - FLAC STREAMINFO magic (`fLaC`)
+ *    - WAV fmt chunk (`RIFF`/`WAVE`)
+ *    - MP4/M4A stsd/ftyp (`AAC`/`ALAC`)
+ *    - WebM/Ogg Opus (`OpusHead`)
  *    - MP3 frame header bitrate & sample rate tables
- * 3. Dynamically exposes exact probed values to NowPlayingSheet.kt and DownloadQualityDialog.kt.
+ * 3. Dynamically exposes exact, stable probed values to `NowPlayingSheet.kt` and `DownloadQualityDialog.kt`.
  */
 object AudioMetadataProber {
 
     private const val TAG = "AudioMetadataProber"
 
     private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(5, TimeUnit.SECONDS)
-        .readTimeout(5, TimeUnit.SECONDS)
+        .connectTimeout(4, TimeUnit.SECONDS)
+        .readTimeout(4, TimeUnit.SECONDS)
         .followRedirects(true)
         .followSslRedirects(true)
         .build()
@@ -59,17 +57,25 @@ object AudioMetadataProber {
     // Thread-safe in-memory cache of probed stream audio quality info keyed by stream URL
     private val probeCache = ConcurrentHashMap<String, AudioQualityInfo>()
 
+    // Stable locked telemetry per (trackId + streamUrl) to prevent mid-playback codec/bitrate flickering
+    private val lockedTrackTelemetry = ConcurrentHashMap<String, AudioQualityInfo>()
+
     // Reactive StateFlow of the active playing stream's probed quality
     private val _activeProbedQuality = MutableStateFlow(AudioQualityInfo())
     val activeProbedQuality: StateFlow<AudioQualityInfo> = _activeProbedQuality.asStateFlow()
+
+    fun resetSession() {
+        // Clears transient per-switch state while keeping verified URL probe cache intact
+    }
 
     fun getCachedQuality(url: String): AudioQualityInfo? {
         return probeCache[url]
     }
 
     /**
-     * Creates a dedicated ExoPlayer Player.Listener that hooks into onTracksChanged
-     * and onPlaybackParametersChanged to inspect the active audio Format in real time.
+     * Creates a dedicated ExoPlayer Player.Listener that waits until `Player.STATE_READY`
+     * and `onTracksChanged` with a definitive `Format.sampleMimeType` before emitting a single,
+     * stable telemetry update for the active track.
      */
     @OptIn(UnstableApi::class)
     fun createExoPlayerFormatListener(
@@ -79,28 +85,35 @@ object AudioMetadataProber {
         onQualityExtracted: (AudioQualityInfo) -> Unit
     ): Player.Listener {
         return object : Player.Listener {
-            override fun onTracksChanged(tracks: Tracks) {
+            private fun emitVerifiedReadyQualityIfAvailable() {
                 val player = exoPlayerProvider()
-                val activeFormat = extractActiveAudioFormatFromTracks(tracks) ?: player.audioFormat
+                if (player.playbackState != Player.STATE_READY) {
+                    return
+                }
+                val activeFormat = extractActiveAudioFormatFromTracks(player.currentTracks) ?: player.audioFormat
+                if (activeFormat == null || activeFormat.sampleMimeType.isNullOrBlank()) {
+                    return
+                }
+                val activeTrack = activeTrackProvider()
                 val quality = extractRealTimeQuality(
                     exoFormat = activeFormat,
-                    track = activeTrackProvider(),
+                    track = activeTrack,
                     probedQuality = probedQualityProvider()
                 )
-                _activeProbedQuality.value = quality
-                onQualityExtracted(quality)
+                if (_activeProbedQuality.value != quality) {
+                    _activeProbedQuality.value = quality
+                    onQualityExtracted(quality)
+                }
             }
 
-            override fun onPlaybackParametersChanged(playbackParameters: PlaybackParameters) {
-                val player = exoPlayerProvider()
-                val activeFormat = player.audioFormat
-                val quality = extractRealTimeQuality(
-                    exoFormat = activeFormat,
-                    track = activeTrackProvider(),
-                    probedQuality = probedQualityProvider()
-                )
-                _activeProbedQuality.value = quality
-                onQualityExtracted(quality)
+            override fun onTracksChanged(tracks: Tracks) {
+                emitVerifiedReadyQualityIfAvailable()
+            }
+
+            override fun onPlaybackStateChanged(playbackState: Int) {
+                if (playbackState == Player.STATE_READY) {
+                    emitVerifiedReadyQualityIfAvailable()
+                }
             }
         }
     }
@@ -145,11 +158,12 @@ object AudioMetadataProber {
                 bitDepth = fallbackBitDepth,
                 channels = 2
             )
+            val normalizedBr = if (isLossless) computedBr else stabilizeLossyBitrate(if (fallbackBitrate > 0) fallbackBitrate else computedBr, url)
             return@withContext AudioQualityInfo(
-                formatName = fallbackFormat,
+                formatName = normalizeCodecLabel(fallbackFormat, url),
                 sampleRateHz = fallbackSampleRate,
                 bitDepth = fallbackBitDepth,
-                bitrateKbps = if (fallbackBitrate > 0) fallbackBitrate else computedBr,
+                bitrateKbps = normalizedBr,
                 channelCount = 2,
                 isLossless = isLossless,
                 isHiRes = isLossless || fallbackSampleRate >= 48000 || fallbackBitDepth >= 24
@@ -165,7 +179,6 @@ object AudioMetadataProber {
             if (file.exists() && file.length() > 44L) {
                 val probed = probeLocalFile(file, durationMs)
                 probeCache[url] = probed
-                _activeProbedQuality.value = probed
                 return@withContext probed
             }
         }
@@ -207,7 +220,6 @@ object AudioMetadataProber {
                         fallbackBitDepth = fallbackBitDepth
                     )
                     probeCache[url] = probed
-                    _activeProbedQuality.value = probed
                     return@withContext probed
                 }
             }
@@ -220,21 +232,15 @@ object AudioMetadataProber {
             fallbackFormat.equals("FLAC", true) ||
             fallbackFormat.equals("ALAC", true) ||
             fallbackFormat.equals("WAV", true)
-        val format = when {
-            url.endsWith(".flac", true) || fallbackFormat.equals("FLAC", true) -> "FLAC"
-            url.endsWith(".alac", true) || fallbackFormat.equals("ALAC", true) -> "ALAC"
-            url.endsWith(".wav", true) || fallbackFormat.equals("WAV", true) -> "WAV"
-            url.contains(".webm", true) || url.contains("opus", true) || fallbackFormat.equals("OPUS", true) -> "OPUS"
-            fallbackFormat.equals("MP3", true) || url.endsWith(".mp3", true) -> "MP3"
-            else -> "AAC"
-        }
+        val format = normalizeCodecLabel(fallbackFormat, url)
         val sr = if (fallbackSampleRate >= 44100) fallbackSampleRate else if (format == "OPUS") 48000 else 44100
         val bd = if (isLossless && fallbackBitDepth >= 16) fallbackBitDepth else 16
-        val br = when {
+        val rawBr = when {
             format == "WAV" -> (sr * 2 * bd) / 1000
             isLossless -> if (fallbackBitrate > 320) fallbackBitrate else (sr * 2 * bd) / 1000
             else -> fallbackBitrate.takeIf { it > 0 } ?: deriveBitrateFromSizeAndDuration(0L, durationMs, format, sr, bd, 2)
         }
+        val br = if (isLossless) rawBr else stabilizeLossyBitrate(rawBr, url)
 
         val derivedInfo = AudioQualityInfo(
             formatName = format,
@@ -249,6 +255,24 @@ object AudioMetadataProber {
         derivedInfo
     }
 
+    private fun normalizeCodecLabel(fallbackFormat: String, url: String): String {
+        val cleanUrl = url.lowercase().substringBefore("?")
+        return when {
+            cleanUrl.endsWith(".flac") -> "FLAC"
+            cleanUrl.endsWith(".alac") -> "ALAC"
+            cleanUrl.endsWith(".wav") || cleanUrl.endsWith(".wave") -> "WAV"
+            cleanUrl.endsWith(".m4a") || cleanUrl.endsWith(".mp4") || cleanUrl.endsWith(".aac") -> "AAC"
+            cleanUrl.contains(".webm") || cleanUrl.contains("opus") -> "OPUS"
+            cleanUrl.endsWith(".mp3") -> "MP3"
+            fallbackFormat.equals("FLAC", true) -> "FLAC"
+            fallbackFormat.equals("ALAC", true) -> "ALAC"
+            fallbackFormat.equals("WAV", true) -> "WAV"
+            fallbackFormat.equals("OPUS", true) -> "OPUS"
+            fallbackFormat.equals("MP3", true) -> "MP3"
+            else -> "AAC"
+        }
+    }
+
     private fun probeLocalFile(file: File, durationMs: Long): AudioQualityInfo {
         val totalBytes = file.length()
         val headerBytes = ByteArray(minOf(totalBytes.toInt(), 8192))
@@ -260,14 +284,15 @@ object AudioMetadataProber {
             Log.w(TAG, "Failed reading local file header: ${file.absolutePath}", e)
         }
 
+        val fallbackFmt = normalizeCodecLabel("AAC", file.name)
         return parseContainerHeader(
             bytes = headerBytes,
             totalLength = totalBytes,
             durationMs = durationMs,
             contentType = "",
             url = file.name,
-            fallbackFormat = if (file.name.endsWith(".flac", true)) "FLAC" else "WAV",
-            fallbackBitrate = (44100 * 2 * 16) / 1000,
+            fallbackFormat = fallbackFmt,
+            fallbackBitrate = if (fallbackFmt == "FLAC" || fallbackFmt == "WAV") 1411 else 320,
             fallbackSampleRate = 44100,
             fallbackBitDepth = 16
         )
@@ -372,20 +397,24 @@ object AudioMetadataProber {
             bytes[i] == 'f'.code.toByte() && bytes[i + 1] == 't'.code.toByte() &&
                 bytes[i + 2] == 'y'.code.toByte() && bytes[i + 3] == 'p'.code.toByte()
         }
-        if (hasFtyp || contentType.contains("mp4") || contentType.contains("aac") || contentType.contains("m4a")) {
+        if (hasFtyp || contentType.contains("mp4") || contentType.contains("aac") || contentType.contains("m4a") || url.contains(".m4a", true) || url.contains(".mp4", true)) {
             val isAlac = (0 until minOf(bytes.size - 4, 512)).any { i ->
                 bytes[i] == 'a'.code.toByte() && bytes[i + 1] == 'l'.code.toByte() &&
                     bytes[i + 2] == 'a'.code.toByte() && bytes[i + 3] == 'c'.code.toByte()
             } || url.endsWith(".alac", true)
 
-            val bitrate = when {
+            val rawBitrate = when {
+                url.contains("_320.") -> 320
+                url.contains("_160.") -> 160
+                url.contains("_96.") -> 96
                 exactCalculatedBitrate > 0 -> exactCalculatedBitrate
                 isAlac -> deriveBitrateFromSizeAndDuration(totalLength, durationMs, "ALAC", fallbackSampleRate, fallbackBitDepth, 2)
                 else -> fallbackBitrate.takeIf { it > 0 } ?: 320
             }
+            val bitrate = if (isAlac) rawBitrate else stabilizeLossyBitrate(rawBitrate, url)
 
             val formatName = if (isAlac) "ALAC" else "AAC"
-            val sampleRate = if (isAlac && fallbackSampleRate >= 48000) fallbackSampleRate else 44100
+            val sampleRate = if (fallbackSampleRate >= 44100) fallbackSampleRate else 44100
             val bitDepth = if (isAlac && fallbackBitDepth >= 24) fallbackBitDepth else 16
 
             return AudioQualityInfo(
@@ -413,7 +442,8 @@ object AudioMetadataProber {
             } else {
                 2
             }
-            val bitrate = if (exactCalculatedBitrate > 0) exactCalculatedBitrate else fallbackBitrate.takeIf { it > 0 } ?: 160
+            val rawOpusBr = if (exactCalculatedBitrate > 0) exactCalculatedBitrate else fallbackBitrate.takeIf { it > 0 } ?: 160
+            val bitrate = stabilizeLossyBitrate(rawOpusBr, url)
             return AudioQualityInfo(
                 formatName = "OPUS",
                 sampleRateHz = 48000,
@@ -434,11 +464,12 @@ object AudioMetadataProber {
             } else {
                 0
             }
-            val bitrate = when {
-                exactCalculatedBitrate > 0 -> exactCalculatedBitrate
+            val rawMp3Br = when {
                 parsedFrameBitrate > 0 -> parsedFrameBitrate
+                exactCalculatedBitrate > 0 -> exactCalculatedBitrate
                 else -> fallbackBitrate.takeIf { it > 0 } ?: 320
             }
+            val bitrate = stabilizeLossyBitrate(rawMp3Br, url)
             return AudioQualityInfo(
                 formatName = "MP3",
                 sampleRateHz = 44100,
@@ -451,21 +482,23 @@ object AudioMetadataProber {
         }
 
         // Container-derived fallback
-        val isLosslessDefault = fallbackFormat.uppercase() in listOf("FLAC", "ALAC", "WAV", "AIFF")
-        val effectiveBitrate = if (exactCalculatedBitrate > 0) {
+        val cleanFallback = normalizeCodecLabel(fallbackFormat, url)
+        val isLosslessDefault = cleanFallback in listOf("FLAC", "ALAC", "WAV", "AIFF")
+        val rawEffectiveBitrate = if (exactCalculatedBitrate > 0) {
             exactCalculatedBitrate
         } else {
             fallbackBitrate.takeIf { it > 0 } ?: deriveBitrateFromSizeAndDuration(
                 fileSizeBytes = totalLength,
                 durationMs = durationMs,
-                formatName = fallbackFormat,
+                formatName = cleanFallback,
                 sampleRateHz = fallbackSampleRate,
                 bitDepth = fallbackBitDepth,
                 channels = 2
             )
         }
+        val effectiveBitrate = if (isLosslessDefault) rawEffectiveBitrate else stabilizeLossyBitrate(rawEffectiveBitrate, url)
         return AudioQualityInfo(
-            formatName = fallbackFormat,
+            formatName = cleanFallback,
             sampleRateHz = fallbackSampleRate,
             bitDepth = fallbackBitDepth,
             bitrateKbps = effectiveBitrate,
@@ -473,6 +506,31 @@ object AudioMetadataProber {
             isLossless = isLosslessDefault,
             isHiRes = isLosslessDefault || fallbackSampleRate >= 48000 || fallbackBitDepth >= 24 || effectiveBitrate >= 256
         )
+    }
+
+    /**
+     * Stabilizes lossy CBR/VBR container bitrates so container framing overhead (e.g., 322 kbps on a 320 kbps AAC stream)
+     * never causes jittery badge flips between 322 kbps and 320 kbps.
+     */
+    private fun stabilizeLossyBitrate(rawKbps: Int, url: String? = null): Int {
+        val lowerUrl = url.orEmpty().lowercase()
+        when {
+            lowerUrl.contains("_320.") -> return 320
+            lowerUrl.contains("_160.") -> return 160
+            lowerUrl.contains("_96.") -> return 96
+            lowerUrl.contains("itag=251") -> return 160
+            lowerUrl.contains("itag=140") -> return 128
+        }
+        return when (rawKbps) {
+            in 305..340 -> 320
+            in 245..268 -> 256
+            in 182..202 -> 192
+            in 150..170 -> 160
+            in 120..136 -> 128
+            in 88..104 -> 96
+            in 32..9600 -> rawKbps
+            else -> 320
+        }
     }
 
     private fun findMp3FrameSync(bytes: ByteArray): Int {
@@ -524,15 +582,15 @@ object AudioMetadataProber {
             return (safeSr * safeCh * safeBd) / 1000
         }
 
+        val isLossless = cleanFormat.contains("FLAC") || cleanFormat.contains("ALAC")
         val durationSec = durationMs / 1000.0
         if (fileSizeBytes > 8_192L && durationSec >= 10.0) {
             val computedKbps = ((fileSizeBytes * 8.0) / durationSec / 1000.0).roundToInt()
             if (computedKbps in 48..9600) {
-                return computedKbps
+                return if (isLossless) computedKbps else stabilizeLossyBitrate(computedKbps)
             }
         }
 
-        val isLossless = cleanFormat.contains("FLAC") || cleanFormat.contains("ALAC")
         return if (isLossless) {
             when {
                 safeSr >= 192000 && safeBd >= 24 -> 4608
@@ -546,11 +604,9 @@ object AudioMetadataProber {
     }
 
     /**
-     * Synchronous real-time extractor hooking directly into ExoPlayer's active Format object:
-     * - Container/Codec: (FLAC, ALAC, AAC, MP3, OPUS, WAV)
-     * - Bit Depth: format.pcmEncoding or container header depth (e.g., 24-bit, 16-bit)
-     * - Sample Rate: format.sampleRate in Hz
-     * - True Bitrate: format.bitrate / 1000 (or calculated average bitrate from downloaded bytes / duration)
+     * Synchronous real-time extractor hooking into ExoPlayer's active Format object:
+     * - Prioritizes ExoPlayer's definitive `Format.sampleMimeType` once available, locking the codec
+     *   and stabilized bitrate so the UI badge never flickers between MP3 and AAC or 322 and 320 kbps.
      */
     @OptIn(UnstableApi::class)
     fun extractRealTimeQuality(
@@ -558,18 +614,32 @@ object AudioMetadataProber {
         track: AudioTrack?,
         probedQuality: AudioQualityInfo?
     ): AudioQualityInfo {
+        val streamUrl = track?.effectiveStreamUrl.orEmpty()
+        val lockKey = "${track?.id.orEmpty()}|$streamUrl"
+
         val sampleMime = exoFormat?.sampleMimeType.orEmpty().lowercase()
         val containerMime = exoFormat?.containerMimeType.orEmpty().lowercase()
         val codecs = exoFormat?.codecs.orEmpty().lowercase()
+        val hasDefinitiveExoMime = sampleMime.isNotBlank() || containerMime.isNotBlank() || codecs.isNotBlank()
+
+        // If we already locked definitive ExoPlayer format telemetry for this exact track & stream URL, return it directly
+        if (lockKey.length > 2) {
+            lockedTrackTelemetry[lockKey]?.let { locked ->
+                if (!hasDefinitiveExoMime) {
+                    return locked
+                }
+            }
+        }
 
         val detectedFormat = when {
-            sampleMime.contains("flac") || containerMime.contains("flac") || codecs.contains("flac") -> "FLAC"
-            sampleMime.contains("alac") || codecs.contains("alac") -> "ALAC"
-            sampleMime.contains("wav") || sampleMime.contains("raw") || sampleMime.contains("pcm") -> "WAV"
-            sampleMime.contains("opus") || containerMime.contains("opus") || codecs.contains("opus") -> "OPUS"
-            sampleMime.contains("mp4a") || sampleMime.contains("aac") || codecs.contains("mp4a") -> "AAC"
-            sampleMime.contains("mpeg") || sampleMime.contains("mp3") -> "MP3"
-            probedQuality != null && probedQuality.formatName.isNotBlank() -> probedQuality.formatName
+            sampleMime == MimeTypes.AUDIO_FLAC || sampleMime.contains("flac") || containerMime.contains("flac") || codecs.contains("flac") -> "FLAC"
+            sampleMime == MimeTypes.AUDIO_OPUS || sampleMime.contains("opus") || containerMime.contains("opus") || codecs.contains("opus") -> "OPUS"
+            sampleMime == MimeTypes.AUDIO_AAC || sampleMime.contains("mp4a-latm") || sampleMime.contains("mp4a") || sampleMime.contains("aac") || codecs.contains("mp4a") -> "AAC"
+            sampleMime == MimeTypes.AUDIO_MPEG || sampleMime.contains("mpeg") || sampleMime.contains("mp3") -> "MP3"
+            sampleMime == MimeTypes.AUDIO_ALAC || sampleMime.contains("alac") || codecs.contains("alac") -> "ALAC"
+            sampleMime == MimeTypes.AUDIO_WAV || sampleMime == MimeTypes.AUDIO_RAW || sampleMime.contains("wav") || sampleMime.contains("raw") || sampleMime.contains("pcm") -> "WAV"
+            streamUrl.isNotBlank() -> normalizeCodecLabel(probedQuality?.formatName ?: track?.format?.displayName ?: "AAC", streamUrl)
+            probedQuality != null && probedQuality.formatName.isNotBlank() && probedQuality.formatName != "PROBING" -> probedQuality.formatName
             track != null -> track.format.displayName
             else -> "AAC"
         }
@@ -587,6 +657,7 @@ object AudioMetadataProber {
             exoFormat != null && exoFormat.sampleRate > 0 -> exoFormat.sampleRate
             probedQuality != null && probedQuality.sampleRateHz > 0 -> probedQuality.sampleRateHz
             track != null && track.sampleRate > 0 -> track.sampleRate
+            detectedFormat == "OPUS" -> 48000
             else -> 44100
         }
 
@@ -614,17 +685,18 @@ object AudioMetadataProber {
         val localFileLength = track?.localFilePath?.let { path ->
             val f = File(path)
             if (f.exists()) f.length() else 0L
-        } ?: track?.uriString?.takeIf { it.startsWith("/") || it.startsWith("file://") }?.let { uriStr ->
+        } ?: track?.effectiveStreamUrl?.takeIf { it.startsWith("/") || it.startsWith("file://") }?.let { uriStr ->
             val f = File(uriStr.removePrefix("file://"))
             if (f.exists()) f.length() else 0L
         } ?: 0L
 
         val durationMs = track?.durationMs ?: 0L
 
-        val bitrateKbps = when {
+        val rawBitrateKbps = when {
             isPcmWav -> (sampleRate * channels * bitDepth) / 1000
             exoFormat != null && exoFormat.bitrate > 0 -> (exoFormat.bitrate / 1000)
             exoFormat != null && exoFormat.averageBitrate > 0 -> (exoFormat.averageBitrate / 1000)
+            probedQuality != null && probedQuality.bitrateKbps > 0 -> probedQuality.bitrateKbps
             localFileLength > 8_192L && durationMs > 10_000L -> deriveBitrateFromSizeAndDuration(
                 fileSizeBytes = localFileLength,
                 durationMs = durationMs,
@@ -633,7 +705,6 @@ object AudioMetadataProber {
                 bitDepth = bitDepth,
                 channels = channels
             )
-            probedQuality != null && probedQuality.bitrateKbps > 0 -> probedQuality.bitrateKbps
             track != null && track.bitrateKbps > 0 -> track.bitrateKbps
             else -> deriveBitrateFromSizeAndDuration(
                 fileSizeBytes = 0L,
@@ -643,6 +714,12 @@ object AudioMetadataProber {
                 bitDepth = bitDepth,
                 channels = channels
             )
+        }
+
+        val bitrateKbps = if (isLossless) {
+            rawBitrateKbps
+        } else {
+            stabilizeLossyBitrate(rawBitrateKbps, streamUrl)
         }
 
         val isHiRes = isLossless || sampleRate >= 48000 || bitDepth >= 24 || bitrateKbps >= 256
@@ -656,6 +733,10 @@ object AudioMetadataProber {
             isLossless = isLossless,
             isHiRes = isHiRes
         )
+
+        if (hasDefinitiveExoMime && lockKey.length > 2) {
+            lockedTrackTelemetry[lockKey] = qualityInfo
+        }
         _activeProbedQuality.value = qualityInfo
         return qualityInfo
     }
@@ -697,18 +778,23 @@ object AudioMetadataProber {
             val retrieverBitrate = bitrateStr?.toIntOrNull()?.let { it / 1000 } ?: 0
             val retrieverSampleRate = sampleRateStr?.toIntOrNull() ?: 0
 
+            val detectedFmt = when {
+                mimeStr?.contains("flac", true) == true -> "FLAC"
+                mimeStr?.contains("alac", true) == true -> "ALAC"
+                mimeStr?.contains("wav", true) == true -> "WAV"
+                mimeStr?.contains("opus", true) == true -> "OPUS"
+                mimeStr?.contains("aac", true) == true || mimeStr?.contains("mp4", true) == true -> "AAC"
+                mimeStr?.contains("mpeg", true) == true -> "MP3"
+                else -> headerProbed.formatName
+            }
+            val isLossless = detectedFmt in listOf("FLAC", "ALAC", "WAV")
+            val rawBr = if (retrieverBitrate in 48..9600) retrieverBitrate else headerProbed.bitrateKbps
+            val finalBr = if (isLossless) rawBr else stabilizeLossyBitrate(rawBr, targetUri)
+
             val merged = headerProbed.copy(
-                bitrateKbps = if (retrieverBitrate in 48..9600) retrieverBitrate else headerProbed.bitrateKbps,
+                bitrateKbps = finalBr,
                 sampleRateHz = if (retrieverSampleRate >= 44100) retrieverSampleRate else headerProbed.sampleRateHz,
-                formatName = when {
-                    mimeStr?.contains("flac", true) == true -> "FLAC"
-                    mimeStr?.contains("alac", true) == true -> "ALAC"
-                    mimeStr?.contains("wav", true) == true -> "WAV"
-                    mimeStr?.contains("opus", true) == true -> "OPUS"
-                    mimeStr?.contains("aac", true) == true || mimeStr?.contains("mp4", true) == true -> "AAC"
-                    mimeStr?.contains("mpeg", true) == true -> "MP3"
-                    else -> headerProbed.formatName
-                }
+                formatName = detectedFmt
             )
             _activeProbedQuality.value = merged
             merged

@@ -19,6 +19,7 @@ import androidx.media3.database.StandaloneDatabaseProvider
 import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.datasource.HttpDataSource
 import androidx.media3.datasource.cache.CacheDataSource
 import androidx.media3.datasource.cache.CacheWriter
 import androidx.media3.datasource.cache.LeastRecentlyUsedCacheEvictor
@@ -38,8 +39,8 @@ import com.example.model.AudioTrack
 import com.example.model.EqualizerPreset
 import com.example.model.RepeatMode
 import com.example.model.StreamBackend
+import com.example.network.MultiProviderStreamResolver
 import com.example.network.ResolvedStreamCandidate
-import com.example.network.StreamMatcher
 import com.example.network.UniversalStreamResolver
 import com.example.util.AlbumArtHelper
 import kotlinx.coroutines.CancellationException
@@ -53,6 +54,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.util.ArrayList
 import java.util.concurrent.ConcurrentHashMap
@@ -61,10 +63,12 @@ import java.util.concurrent.ConcurrentHashMap
  * High-Fidelity Media3 ExoPlayer Audio Engine configured with:
  * 1. Singleton 200MB LRU Disk Cache (SimpleCache + LeastRecentlyUsedCacheEvictor + CacheDataSource.Factory)
  *    for instant zero-latency replay and reduced network load.
- * 2. 80% Track Progress Pre-Buffering Pipeline: Asynchronously resolves and pre-warms the first 2MB
- *    of the upcoming track in the queue into SimpleCache using CacheWriter.
- * 3. Direct Container Format Probing via AudioMetadataProber (onTracksChanged & onPlaybackParametersChanged).
- * 4. 100% Atomic Track Switching via AudioPlayerService (stop -> clearMediaItems -> reset buffers -> READY).
+ * 2. Strengthened `DefaultHttpDataSource.Factory` (25s timeouts, desktop Chrome User-Agent,
+ *    `Range: bytes=0-`, `Referer: https://www.youtube.com/`, `Origin: https://www.youtube.com`).
+ * 3. Custom `DefaultLoadControl` (`minBufferMs = 30000`, `maxBufferMs = 90000`,
+ *    `bufferForPlaybackMs = 2500`, `bufferForPlaybackAfterRebufferMs = 5000`).
+ * 4. Multi-Provider Auto-Retry on `HttpDataSourceException` (403 Forbidden / server reset) via `MultiProviderStreamResolver`.
+ * 5. High-frequency 50ms playback position polling for lock-step synchronized lyrics.
  */
 @OptIn(UnstableApi::class)
 class ExoPlayerAudioEngine(private val context: Context) {
@@ -143,6 +147,8 @@ class ExoPlayerAudioEngine(private val context: Context) {
     private var pendingTrack: AudioTrack? = null
     @Volatile
     private var pendingQuality: AudioQualityInfo? = null
+    @Volatile
+    private var isCascadingFallback: Boolean = false
 
     // Dynamic stream candidates sorted by BitDepth -> SampleRate -> Bitrate -> Codec
     private var activeStreamCandidates: List<ResolvedStreamCandidate> = emptyList()
@@ -182,13 +188,13 @@ class ExoPlayerAudioEngine(private val context: Context) {
             setEnableDecoderFallback(true)
         }
 
-        // 2. Configure LoadControl for low-latency startup and resilient buffering
+        // 2. Configure Custom DefaultLoadControl for Audio (30s minBuffer, 90s maxBuffer, 2.5s start, 5s rebuffer)
         val loadControl = DefaultLoadControl.Builder()
             .setBufferDurationsMs(
-                /* minBufferMs = */ 10_000,
-                /* maxBufferMs = */ 40_000,
-                /* bufferForPlaybackMs = */ 600,
-                /* bufferForPlaybackAfterRebufferMs = */ 1_800
+                /* minBufferMs = */ 30000,
+                /* maxBufferMs = */ 90000,
+                /* bufferForPlaybackMs = */ 2500,
+                /* bufferForPlaybackAfterRebufferMs = */ 5000
             )
             .setPrioritizeTimeOverSizeThresholds(true)
             .build()
@@ -199,13 +205,19 @@ class ExoPlayerAudioEngine(private val context: Context) {
             .setUsage(C.USAGE_MEDIA)
             .build()
 
-        // 4. Configure HTTP DataSource and wrap in 200MB LRU SimpleCache CacheDataSource.Factory
+        // 4. Configure HTTP DataSource with 25s timeouts, desktop Chrome User-Agent & YouTube streaming headers
         val httpDataSourceFactory = DefaultHttpDataSource.Factory()
-            .setUserAgent("Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36 FlowAudio/2.0")
-            .setConnectTimeoutMs(15000)
-            .setReadTimeoutMs(25000)
+            .setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
             .setAllowCrossProtocolRedirects(true)
-            .setDefaultRequestProperties(mapOf("Accept" to "*/*"))
+            .setConnectTimeoutMs(25000)
+            .setReadTimeoutMs(25000)
+            .setDefaultRequestProperties(
+                mapOf(
+                    "Range" to "bytes=0-",
+                    "Referer" to "https://www.youtube.com/",
+                    "Origin" to "https://www.youtube.com"
+                )
+            )
 
         val upstreamDataSourceFactory = DefaultDataSource.Factory(context, httpDataSourceFactory)
         val simpleCache = getOrCreateSimpleCache(context)
@@ -215,7 +227,8 @@ class ExoPlayerAudioEngine(private val context: Context) {
             .setUpstreamDataSourceFactory(upstreamDataSourceFactory)
             .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
 
-        val mediaSourceFactory = DefaultMediaSourceFactory(cacheDataSourceFactory)
+        val mediaSourceFactory = DefaultMediaSourceFactory(context)
+            .setDataSourceFactory(cacheDataSourceFactory)
 
         exoPlayer = ExoPlayer.Builder(context, renderersFactory)
             .setMediaSourceFactory(mediaSourceFactory)
@@ -242,10 +255,10 @@ class ExoPlayerAudioEngine(private val context: Context) {
     }
 
     /**
-     * Verified Stream Handoff & Duration Sanity Check:
+     * Verified Stream Handoff & Preview Guard:
      * 1. Verifies the playing MediaItem's mediaId matches the pending track via AudioPlayerService.
-     * 2. Performs a strict duration sanity check on online streams when ExoPlayer reports duration.
-     * 3. Commits and broadcasts the active track UI & mini-player state only after verification.
+     * 2. Rejects 30-second preview clips (< 60s when expected >= 60s) and cascades to the next provider.
+     * 3. Commits and broadcasts the active track UI, mini-player, and notification state immediately on preparation.
      */
     private fun commitPendingTrackIfReady() {
         val pending = pendingTrack ?: return
@@ -254,28 +267,33 @@ class ExoPlayerAudioEngine(private val context: Context) {
         }
 
         val playerDurationMs = exoPlayer.duration
-        if (playerDurationMs > 0L && pending.durationMs > 10_000L && !pending.isLocalImport && !pending.isDownloaded) {
-            if (!StreamMatcher.isDurationValid(playerDurationMs, pending.durationMs)) {
-                Log.w(
-                    "ExoPlayerAudioEngine",
-                    "Duration sanity check rejected stream (${playerDurationMs}ms vs expected ${pending.durationMs}ms). Cascading."
-                )
-                triggerCandidateFallback("DurationMismatch")
-                return
-            }
+        if (
+            playerDurationMs in 1_000L..59_999L &&
+            (pending.durationMs >= 60_000L || pending.durationMs == 0L) &&
+            !pending.isLocalImport &&
+            !pending.isDownloaded &&
+            currentCandidateIndex + 1 < activeStreamCandidates.size
+        ) {
+            Log.w(
+                "ExoPlayerAudioEngine",
+                "Rejected <60s snippet preview (${playerDurationMs}ms vs expected ${pending.durationMs}ms). Cascading."
+            )
+            triggerCandidateFallback("PreviewClipRejected")
+            return
         }
 
         val realDuration = playerDurationMs.takeIf { it > 0L } ?: pending.durationMs
         val committedTrack = if (realDuration > 0L) pending.copy(durationMs = realDuration) else pending
 
-        val quality = pendingQuality ?: activeResolvedQuality ?: AudioMetadataProber.extractRealTimeQuality(
+        val quality = AudioMetadataProber.extractRealTimeQuality(
             exoFormat = exoPlayer.audioFormat,
             track = committedTrack,
-            probedQuality = null
+            probedQuality = pendingQuality ?: activeResolvedQuality
         )
 
         pendingTrack = null
         pendingQuality = null
+        isCascadingFallback = false
         isSwitchingTrack = false
         _isLoadingTrack.value = false
 
@@ -286,6 +304,31 @@ class ExoPlayerAudioEngine(private val context: Context) {
         onTrackTransition?.invoke(committedTrack)
         onAudioQualityChanged?.invoke(quality)
 
+        // Deep probe container header in background to refine exact bitrate/sampleRate if ExoPlayer Format.bitrate is unset
+        val streamUrl = committedTrack.effectiveStreamUrl
+        if (!streamUrl.isNullOrBlank()) {
+            scope.launch {
+                val probed = AudioPlayerService.probeStreamContainer(
+                    url = streamUrl,
+                    durationMs = committedTrack.durationMs,
+                    fallbackFormat = quality.formatName,
+                    fallbackBitrate = quality.bitrateKbps,
+                    fallbackSampleRate = quality.sampleRateHz,
+                    fallbackBitDepth = quality.bitDepth
+                )
+                if (currentTrack?.id == committedTrack.id) {
+                    activeResolvedQuality = probed
+                    val merged = AudioMetadataProber.extractRealTimeQuality(
+                        exoFormat = exoPlayer.audioFormat,
+                        track = committedTrack,
+                        probedQuality = probed
+                    )
+                    _audioQualityState.value = merged
+                    onAudioQualityChanged?.invoke(merged)
+                }
+            }
+        }
+
         val curIdx = currentPlaylist.indexOfFirst { it.id == committedTrack.id }
         if (curIdx != -1 && currentPlaylist.size - (curIdx + 1) <= 3) {
             onQueueNearEnd?.invoke()
@@ -293,10 +336,20 @@ class ExoPlayerAudioEngine(private val context: Context) {
     }
 
     /**
-     * Cascades to the next highest-quality stream candidate when a candidate fails or is rejected by duration check.
+     * Cascades to the next highest-quality stream candidate or invokes `MultiProviderStreamResolver`
+     * when a candidate fails (e.g., HTTP 403 Forbidden / `HttpDataSourceException`) or is a preview clip.
      */
     private fun triggerCandidateFallback(reason: String) {
+        if (isCascadingFallback) return
         val track = pendingTrack ?: currentTrack ?: _currentTrackState.value ?: return
+        isCascadingFallback = true
+
+        val failedUrl = track.effectiveStreamUrl.orEmpty()
+        val videoId = MultiProviderStreamResolver.extractCleanVideoId(track.id)
+
+        if (failedUrl.isNotEmpty()) {
+            MultiProviderStreamResolver.markUrlFailed(videoId.ifEmpty { track.id }, failedUrl)
+        }
 
         if (currentCandidateIndex + 1 < activeStreamCandidates.size) {
             currentCandidateIndex++
@@ -314,6 +367,7 @@ class ExoPlayerAudioEngine(private val context: Context) {
                 try {
                     val updatedTrack = track.copy(
                         uriString = nextCandidate.directStreamUrl,
+                        streamUrl = nextCandidate.directStreamUrl,
                         format = mapFormatStringToEnum(nextCandidate.formatName, track.format),
                         bitrateKbps = nextCandidate.bitrateKbps,
                         sampleRate = nextCandidate.sampleRateHz,
@@ -328,20 +382,106 @@ class ExoPlayerAudioEngine(private val context: Context) {
                         context = context,
                         track = updatedTrack,
                         candidate = nextCandidate,
-                        preservePosition = false
+                        preservePosition = true,
+                        scope = scope,
+                        onStateVerifiedReady = { _, _ -> commitPendingTrackIfReady() }
                     )
                 } catch (e: Exception) {
                     Log.e("ExoPlayerAudioEngine", "Candidate fallback failed", e)
+                } finally {
+                    isCascadingFallback = false
                 }
             }
             return
         }
 
-        // Online candidates exhausted: notify error without falling back to fake/synthetic audio
-        isSwitchingTrack = false
-        _isLoadingTrack.value = false
-        _playbackError.value = "Playback unavailable for '${track.title}'. Stream could not be reached."
-        Log.e("ExoPlayerAudioEngine", "All stream candidates exhausted for track: ${track.title} ($reason)")
+        // Query MultiProviderStreamResolver for the next provider's stream URL (skipping failed URLs)
+        scope.launch {
+            try {
+                val excludedSet = activeStreamCandidates.map { it.directStreamUrl }.toSet() + setOf(failedUrl)
+                val nextProviderCandidate = withContext(Dispatchers.IO) {
+                    MultiProviderStreamResolver.resolveBestStreamCandidate(
+                        videoId = videoId,
+                        track = track,
+                        excludedUrls = excludedSet
+                    ).getOrNull()
+                }
+
+                if (nextProviderCandidate != null &&
+                    nextProviderCandidate.directStreamUrl.isNotBlank() &&
+                    nextProviderCandidate.directStreamUrl !in excludedSet
+                ) {
+                    activeStreamCandidates = activeStreamCandidates + nextProviderCandidate
+                    currentCandidateIndex = activeStreamCandidates.lastIndex
+                    val fallbackQuality = nextProviderCandidate.toAudioQualityInfo()
+                    activeResolvedQuality = fallbackQuality
+                    _activeStreamCandidate.value = nextProviderCandidate
+
+                    val updatedTrack = track.copy(
+                        uriString = nextProviderCandidate.directStreamUrl,
+                        streamUrl = nextProviderCandidate.directStreamUrl,
+                        format = mapFormatStringToEnum(nextProviderCandidate.formatName, track.format),
+                        bitrateKbps = nextProviderCandidate.bitrateKbps,
+                        sampleRate = nextProviderCandidate.sampleRateHz,
+                        bitDepth = nextProviderCandidate.bitDepth,
+                        sourceProvider = nextProviderCandidate.providerName
+                    )
+                    pendingTrack = updatedTrack
+                    pendingQuality = fallbackQuality
+
+                    AudioPlayerService.switchStreamAtomically(
+                        exoPlayer = exoPlayer,
+                        context = context,
+                        track = updatedTrack,
+                        candidate = nextProviderCandidate,
+                        preservePosition = true,
+                        scope = scope,
+                        onStateVerifiedReady = { _, _ -> commitPendingTrackIfReady() }
+                    )
+                    return@launch
+                }
+
+                val cdnFallback = UniversalStreamResolver.resolveCanonicalCdnFallback(track)
+                if (cdnFallback.directStreamUrl.isNotBlank() && cdnFallback.directStreamUrl !in excludedSet) {
+                    activeStreamCandidates = activeStreamCandidates + cdnFallback
+                    currentCandidateIndex = activeStreamCandidates.lastIndex
+                    val fallbackQuality = cdnFallback.toAudioQualityInfo()
+                    activeResolvedQuality = fallbackQuality
+                    _activeStreamCandidate.value = cdnFallback
+
+                    val updatedTrack = track.copy(
+                        uriString = cdnFallback.directStreamUrl,
+                        streamUrl = cdnFallback.directStreamUrl,
+                        format = mapFormatStringToEnum(cdnFallback.formatName, track.format),
+                        bitrateKbps = cdnFallback.bitrateKbps,
+                        sampleRate = cdnFallback.sampleRateHz,
+                        bitDepth = cdnFallback.bitDepth,
+                        sourceProvider = cdnFallback.providerName
+                    )
+                    pendingTrack = updatedTrack
+                    pendingQuality = fallbackQuality
+
+                    AudioPlayerService.switchStreamAtomically(
+                        exoPlayer = exoPlayer,
+                        context = context,
+                        track = updatedTrack,
+                        candidate = cdnFallback,
+                        preservePosition = false,
+                        scope = scope,
+                        onStateVerifiedReady = { _, _ -> commitPendingTrackIfReady() }
+                    )
+                    return@launch
+                }
+
+                // Online candidates exhausted
+                isSwitchingTrack = false
+                _isLoadingTrack.value = false
+                _playbackError.value = "Playback unavailable for '${track.title}'. Stream could not be reached."
+                Log.e("ExoPlayerAudioEngine", "All stream candidates exhausted for track: ${track.title} ($reason)")
+            } finally {
+                isCascadingFallback = false
+            }
+        }
     }
 
     private fun setupPlayerListeners() {
@@ -377,11 +517,15 @@ class ExoPlayerAudioEngine(private val context: Context) {
             }
 
             override fun onTracksChanged(tracks: Tracks) {
-                updateDynamicAudioQuality()
+                if (exoPlayer.playbackState == Player.STATE_READY) {
+                    updateDynamicAudioQuality()
+                }
             }
 
             override fun onPlaybackParametersChanged(playbackParameters: PlaybackParameters) {
-                updateDynamicAudioQuality()
+                if (exoPlayer.playbackState == Player.STATE_READY) {
+                    updateDynamicAudioQuality()
+                }
             }
 
             override fun onPlaybackStateChanged(playbackState: Int) {
@@ -405,19 +549,8 @@ class ExoPlayerAudioEngine(private val context: Context) {
                     fftAudioProcessor.setPlaying(false)
                     _isPlayingState.value = false
                     onPlaybackStateChanged?.invoke(false)
-                    // Auto-advance to next track in playlist via atomic playTrack
-                    if (isGaplessEnabled && currentPlaylist.size > 1) {
-                        val activeId = currentTrack?.id
-                        val curIdx = currentPlaylist.indexOfFirst { it.id == activeId }
-                        if (curIdx != -1 && curIdx + 1 < currentPlaylist.size) {
-                            val nextTrack = currentPlaylist[curIdx + 1]
-                            playTrack(nextTrack, currentPlaylist, activeBackend)
-                            if (currentPlaylist.size - (curIdx + 2) <= 3) {
-                                onQueueNearEnd?.invoke()
-                            }
-                        } else if (exoPlayer.repeatMode == Player.REPEAT_MODE_ALL && currentPlaylist.isNotEmpty()) {
-                            playTrack(currentPlaylist.first(), currentPlaylist, activeBackend)
-                        }
+                    if (isGaplessEnabled) {
+                        playNext()
                     }
                 } else if (playbackState == Player.STATE_IDLE) {
                     fftAudioProcessor.setPlaying(false)
@@ -445,19 +578,48 @@ class ExoPlayerAudioEngine(private val context: Context) {
             }
 
             override fun onPlayerError(error: PlaybackException) {
-                Log.w("ExoPlayerAudioEngine", "Player error encountered: ${error.errorCodeName} (${error.errorCode})", error)
+                val isHttpSourceError = isHttpDataSourceException(error)
+                Log.w(
+                    "ExoPlayerAudioEngine",
+                    "Player error encountered (isHttpDataSourceException=$isHttpSourceError): ${error.errorCodeName} (${error.errorCode})",
+                    error
+                )
                 _isPlayingState.value = false
                 onPlaybackStateChanged?.invoke(false)
+
+                if (isHttpSourceError) {
+                    val active = pendingTrack ?: currentTrack ?: _currentTrackState.value
+                    val videoId = MultiProviderStreamResolver.extractCleanVideoId(active?.id.orEmpty())
+                    val failedUrl = active?.effectiveStreamUrl.orEmpty()
+                    if (videoId.isNotEmpty() && failedUrl.isNotEmpty()) {
+                        MultiProviderStreamResolver.markUrlFailed(videoId, failedUrl)
+                    }
+                }
                 triggerCandidateFallback(error.errorCodeName)
             }
         })
     }
 
+    private fun isHttpDataSourceException(error: PlaybackException): Boolean {
+        var cause: Throwable? = error.cause
+        while (cause != null) {
+            if (cause is HttpDataSource.HttpDataSourceException) {
+                return true
+            }
+            cause = cause.cause
+        }
+        return error.errorCode == PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS ||
+            error.errorCode == PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED ||
+            error.errorCode == PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT
+    }
+
     /**
      * Dynamically binds the UI quality state to the active stream's real technical properties via AudioMetadataProber.
+     * Only emits when ExoPlayer is in STATE_READY with a valid format to prevent codec/bitrate flickering.
      */
     fun updateDynamicAudioQuality() {
-        val format = exoPlayer.audioFormat
+        val format = exoPlayer.audioFormat ?: return
+        if (exoPlayer.playbackState != Player.STATE_READY) return
         val track = currentTrack ?: _currentTrackState.value
         val resolved = activeResolvedQuality
 
@@ -467,8 +629,10 @@ class ExoPlayerAudioEngine(private val context: Context) {
             probedQuality = resolved
         )
 
-        _audioQualityState.value = qualityInfo
-        onAudioQualityChanged?.invoke(qualityInfo)
+        if (_audioQualityState.value != qualityInfo) {
+            _audioQualityState.value = qualityInfo
+            onAudioQualityChanged?.invoke(qualityInfo)
+        }
     }
 
     /**
@@ -479,7 +643,10 @@ class ExoPlayerAudioEngine(private val context: Context) {
      */
     private fun triggerNextTrackPrebufferIfNeeded(currentPositionMs: Long, durationMs: Long) {
         if (durationMs <= 15_000L || currentPositionMs < (durationMs * 0.80).toLong()) return
-        if (currentPlaylist.size <= 1) return
+        if (currentPlaylist.size <= 1) {
+            onQueueNearEnd?.invoke()
+            return
+        }
 
         val activeId = (currentTrack ?: _currentTrackState.value)?.id ?: return
         val curIdx = currentPlaylist.indexOfFirst { it.id == activeId }
@@ -497,12 +664,19 @@ class ExoPlayerAudioEngine(private val context: Context) {
         prebufferJob?.cancel()
         prebufferJob = scope.launch(Dispatchers.IO) {
             try {
-                val candidates = UniversalStreamResolver.resolveAllStreamCandidates(
-                    context = context,
-                    track = nextTrack,
-                    backend = activeBackend
-                )
-                val bestCandidate = candidates.firstOrNull() ?: return@launch
+                val videoId = MultiProviderStreamResolver.extractCleanVideoId(nextTrack.id)
+                val bestCandidate = if (videoId.isNotEmpty()) {
+                    MultiProviderStreamResolver.resolveBestStreamCandidate(videoId, nextTrack).getOrNull()
+                } else {
+                    withTimeoutOrNull(AudioPlayerService.STREAM_RESOLUTION_TIMEOUT_MS) {
+                        UniversalStreamResolver.resolvePrimaryStream(
+                            context = context,
+                            track = nextTrack,
+                            backend = activeBackend
+                        )
+                    }
+                } ?: return@launch
+
                 val streamUrl = bestCandidate.directStreamUrl.ifBlank { bestCandidate.streamUrl }
                 if (streamUrl.isBlank() || streamUrl.startsWith("/") || streamUrl.startsWith("file://")) {
                     return@launch
@@ -536,13 +710,12 @@ class ExoPlayerAudioEngine(private val context: Context) {
     }
 
     /**
-     * 100% Atomic Audio Player Synchronization (Zero Desync):
-     * 1. Direct Track & URL Binding: Uses the unique track.id and direct streamUrl directly.
-     * 2. Hard Reset Before Load: Synchronously executes exoPlayer.stop() and exoPlayer.clearMediaItems(),
-     *    resets internal buffering states, and cancels any pending stream loading jobs.
-     * 3. Verified Stream Handoff: Passes the exact resolved streamUrl of the selected track to ExoPlayer,
-     *    waits for STATE_READY, and ONLY updates the active track UI & mini-player state
-     *    AFTER the player engine confirms it has buffered the selected track's URL.
+     * Click-to-Play Pipeline with Multi-Provider Stream Resolution:
+     * 1. Immediate Atomic Reset: Synchronously calls exoPlayer.stop() and exoPlayer.clearMediaItems(),
+     *    updates _currentTrackState = track immediately (<50ms), and sets _isLoadingTrack = true.
+     * 2. Executes MultiProviderStreamResolver cascade (IOS -> ANDROID_MUSIC -> Piped -> Invidious)
+     *    or UniversalStreamResolver fallback.
+     * 3. Feeds the resolved stream URI directly to ExoPlayer without synchronous container probing.
      */
     fun playTrack(
         track: AudioTrack,
@@ -553,131 +726,71 @@ class ExoPlayerAudioEngine(private val context: Context) {
         isSwitchingTrack = true
         activeBackend = backend
 
-        // Step 1: Cancel any pending/in-flight stream loading jobs & position pollers
         playbackSwitchJob?.cancel()
         positionPollerJob?.cancel()
         fftAudioProcessor.setPlaying(false)
-
-        _isLoadingTrack.value = true
-        _playbackError.value = null
+        AudioMetadataProber.resetSession()
 
         val effectiveQueue = if (queue.isNotEmpty()) queue else listOf(track)
+        currentPlaylist = effectiveQueue
+        currentTrack = track
+        pendingTrack = track
+        pendingQuality = null
 
-        // Step 2: Synchronously execute hard stop, media item clearance, and buffer reset
-        AudioPlayerService.resetPlayerBuffersSynchronously(exoPlayer)
+        exoPlayer.pauseAtEndOfMediaItems = !isGaplessEnabled
 
-        val immediateCandidate = UniversalStreamResolver.getImmediateStreamCandidate(context, track)
+        playbackSwitchJob = AudioPlayerService.resolveAndPlayTrackNonBlocking(
+            scope = scope,
+            exoPlayer = exoPlayer,
+            context = context,
+            track = track,
+            backend = backend,
+            onImmediateTrackSelected = { selectedTrack ->
+                _currentTrackState.value = selectedTrack
+                _durationState.value = selectedTrack.durationMs
+                _currentPositionState.value = 0L
+                _isPlayingState.value = false
+                _isLoadingTrack.value = true
+                _playbackError.value = null
+                onTrackTransition?.invoke(selectedTrack)
+            },
+            onCandidatesResolved = { candidates, primaryCandidate ->
+                if (requestId == activeSwitchRequestId) {
+                    activeStreamCandidates = candidates
+                    _availableStreamCandidates.value = candidates
+                    _activeStreamCandidate.value = primaryCandidate
+                    currentCandidateIndex = 0
+                    activeResolvedQuality = primaryCandidate.toAudioQualityInfo()
 
-        if (immediateCandidate != null) {
-            activeStreamCandidates = listOf(immediateCandidate)
-            _availableStreamCandidates.value = listOf(immediateCandidate)
-            _activeStreamCandidate.value = immediateCandidate
-            currentCandidateIndex = 0
-
-            val immediateQuality = immediateCandidate.toAudioQualityInfo()
-            activeResolvedQuality = immediateQuality
-
-            val immediateTrack = track.copy(
-                uriString = immediateCandidate.directStreamUrl,
-                format = mapFormatStringToEnum(immediateCandidate.formatName, track.format),
-                bitrateKbps = immediateCandidate.bitrateKbps,
-                sampleRate = immediateCandidate.sampleRateHz,
-                bitDepth = immediateCandidate.bitDepth,
-                sourceProvider = immediateCandidate.providerName
-            )
-
-            val updatedQueue = if (effectiveQueue.any { it.id == immediateTrack.id }) {
-                effectiveQueue.map { if (it.id == immediateTrack.id) immediateTrack else it }
-            } else {
-                listOf(immediateTrack) + effectiveQueue
-            }
-
-            currentPlaylist = updatedQueue
-            pendingTrack = immediateTrack
-            pendingQuality = immediateQuality
-
-            exoPlayer.pauseAtEndOfMediaItems = !isGaplessEnabled
-            AudioPlayerService.switchStreamAtomically(
-                exoPlayer = exoPlayer,
-                context = context,
-                track = immediateTrack,
-                candidate = immediateCandidate,
-                preservePosition = false
-            )
-        } else {
-            // No cached candidate yet; set pending state and resolve genuine stream asynchronously
-            pendingTrack = track
-            pendingQuality = null
-            currentPlaylist = effectiveQueue
-        }
-
-        // Step 3: Run full stream resolution & format probing asynchronously in the background
-        playbackSwitchJob = scope.launch {
-            try {
-                val fullCandidates = withContext(Dispatchers.IO) {
-                    UniversalStreamResolver.resolveAllStreamCandidates(context, track, backend)
-                }
-                if (!isActive || requestId != activeSwitchRequestId) return@launch
-
-                if (fullCandidates.isNotEmpty()) {
-                    activeStreamCandidates = fullCandidates
-                    _availableStreamCandidates.value = fullCandidates
-
-                    val topCandidate = fullCandidates.first()
-
-                    val shouldUpgrade = immediateCandidate == null || (
-                        topCandidate.directStreamUrl != immediateCandidate.directStreamUrl &&
-                            ((topCandidate.isLossless && !immediateCandidate.isLossless) ||
-                                topCandidate.bitDepth > immediateCandidate.bitDepth ||
-                                topCandidate.sampleRateHz > immediateCandidate.sampleRateHz ||
-                                topCandidate.bitrateKbps > immediateCandidate.bitrateKbps)
+                    val resolvedUrl = primaryCandidate.directStreamUrl.ifBlank { primaryCandidate.streamUrl }
+                    val updatedTrack = track.copy(
+                        uriString = resolvedUrl,
+                        streamUrl = resolvedUrl,
+                        format = mapFormatStringToEnum(primaryCandidate.formatName, track.format),
+                        bitrateKbps = primaryCandidate.bitrateKbps,
+                        sampleRate = primaryCandidate.sampleRateHz,
+                        bitDepth = primaryCandidate.bitDepth,
+                        sourceProvider = primaryCandidate.providerName
                     )
-
-                    if (shouldUpgrade) {
-                        currentCandidateIndex = 0
-                        _activeStreamCandidate.value = topCandidate
-                        activeResolvedQuality = topCandidate.toAudioQualityInfo()
-
-                        val upgradedTrack = track.copy(
-                            uriString = topCandidate.directStreamUrl,
-                            format = mapFormatStringToEnum(topCandidate.formatName, track.format),
-                            bitrateKbps = topCandidate.bitrateKbps,
-                            sampleRate = topCandidate.sampleRateHz,
-                            bitDepth = topCandidate.bitDepth,
-                            sourceProvider = topCandidate.providerName
-                        )
-
-                        if (!isActive || requestId != activeSwitchRequestId) return@launch
-
-                        pendingTrack = upgradedTrack
-                        pendingQuality = topCandidate.toAudioQualityInfo()
-
-                        AudioPlayerService.switchStreamAtomically(
-                            exoPlayer = exoPlayer,
-                            context = context,
-                            track = upgradedTrack,
-                            candidate = topCandidate,
-                            preservePosition = (immediateCandidate != null)
-                        )
-                    } else {
-                        _activeStreamCandidate.value = topCandidate
-                        _audioQualityState.value = topCandidate.toAudioQualityInfo()
-                        activeResolvedQuality = topCandidate.toAudioQualityInfo()
-                    }
-                } else {
-                    if (!isActive || requestId != activeSwitchRequestId) return@launch
-                    _isLoadingTrack.value = false
-                    isSwitchingTrack = false
-                    _playbackError.value = "Playback unavailable for '${track.title}'. Stream could not be reached."
+                    currentTrack = updatedTrack
+                    _currentTrackState.value = updatedTrack
+                    pendingTrack = updatedTrack
+                    pendingQuality = primaryCandidate.toAudioQualityInfo()
                 }
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                runCatching {
-                    Log.e("ExoPlayerAudioEngine", "Background stream resolution error for ${track.title}", e)
+            },
+            onStateVerifiedReady = { _, _ ->
+                if (requestId == activeSwitchRequestId) {
+                    commitPendingTrackIfReady()
+                }
+            },
+            onError = { errorMsg ->
+                if (requestId == activeSwitchRequestId) {
+                    isSwitchingTrack = false
+                    _isLoadingTrack.value = false
+                    _playbackError.value = errorMsg
                 }
             }
-        }
+        )
     }
 
     /**
@@ -695,6 +808,7 @@ class ExoPlayerAudioEngine(private val context: Context) {
 
         val switchedTrack = current.copy(
             uriString = candidate.directStreamUrl,
+            streamUrl = candidate.directStreamUrl,
             format = mapFormatStringToEnum(candidate.formatName, current.format),
             bitrateKbps = candidate.bitrateKbps,
             sampleRate = candidate.sampleRateHz,
@@ -710,7 +824,9 @@ class ExoPlayerAudioEngine(private val context: Context) {
             context = context,
             track = switchedTrack,
             candidate = candidate,
-            preservePosition = true
+            preservePosition = true,
+            scope = scope,
+            onStateVerifiedReady = { _, _ -> commitPendingTrackIfReady() }
         )
     }
 
@@ -725,15 +841,48 @@ class ExoPlayerAudioEngine(private val context: Context) {
     }
 
     fun playNext() {
-        if (currentPlaylist.isEmpty()) return
-        val activeId = (pendingTrack ?: currentTrack ?: _currentTrackState.value)?.id
-        val currentIdx = currentPlaylist.indexOfFirst { it.id == activeId }
-        val nextIdx = if (currentIdx in 0 until currentPlaylist.size - 1) {
-            currentIdx + 1
-        } else {
-            0
+        val activeTrack = pendingTrack ?: currentTrack ?: _currentTrackState.value ?: return
+        val currentIdx = currentPlaylist.indexOfFirst { it.id == activeTrack.id }
+
+        if (currentPlaylist.size > 1 && currentIdx in 0 until currentPlaylist.size - 1) {
+            val nextTrack = currentPlaylist[currentIdx + 1]
+            playTrack(nextTrack, currentPlaylist, activeBackend)
+            if (currentPlaylist.size - (currentIdx + 2) <= 2) {
+                onQueueNearEnd?.invoke()
+            }
+            return
         }
-        playTrack(currentPlaylist[nextIdx], currentPlaylist, activeBackend)
+
+        if (currentPlaylist.size > 1 && exoPlayer.repeatMode == Player.REPEAT_MODE_ALL) {
+            playTrack(currentPlaylist.first(), currentPlaylist, activeBackend)
+            return
+        }
+
+        // Queue has only 1 song or reached the end: dynamically fetch related songs via TrackRadioRepository
+        onQueueNearEnd?.invoke()
+        scope.launch {
+            _isLoadingTrack.value = true
+            val radioTracks = withContext(Dispatchers.IO) {
+                runCatching {
+                    com.example.network.TrackRadioRepository.generateTrackRadio(
+                        seedTrack = activeTrack,
+                        limit = 10,
+                        excludedTrackIds = currentPlaylist.map { it.id }.toSet()
+                    )
+                }.getOrNull().orEmpty()
+            }
+            if (radioTracks.isNotEmpty()) {
+                val updatedQueue = (currentPlaylist + radioTracks).distinctBy { it.id }
+                currentPlaylist = updatedQueue
+                val nextRadioTrack = radioTracks.first()
+                playTrack(nextRadioTrack, updatedQueue, activeBackend)
+            } else if (currentPlaylist.isNotEmpty()) {
+                val fallbackNext = currentPlaylist.first()
+                playTrack(fallbackNext, currentPlaylist, activeBackend)
+            } else {
+                _isLoadingTrack.value = false
+            }
+        }
     }
 
     fun playPrevious() {
@@ -804,6 +953,9 @@ class ExoPlayerAudioEngine(private val context: Context) {
         exoPlayer.volume = volume.coerceIn(0f, 1f)
     }
 
+    /**
+     * Step 3.1: High-Frequency Polling (50ms) while playing so lyrics highlighting keeps lock-step with vocals.
+     */
     private fun startPositionPoller() {
         positionPollerJob?.cancel()
         positionPollerJob = scope.launch {
@@ -825,78 +977,9 @@ class ExoPlayerAudioEngine(private val context: Context) {
                 _visualizerAmplitudes.value = amplitudes
                 onVisualizerUpdate?.invoke(amplitudes)
 
-                delay(33L)
+                delay(50L)
             }
         }
-    }
-
-    private fun createMediaItemForTrack(
-        track: AudioTrack,
-        isActiveTrack: Boolean = false
-    ): MediaItem {
-        val (uri, detectedMimeType) = if ((track.isDownloaded || !track.localFilePath.isNullOrBlank()) && track.localFilePath != null && File(track.localFilePath).exists()) {
-            val localFile = File(track.localFilePath)
-            val uriStr = localFile.absolutePath.lowercase()
-            val mime = when {
-                uriStr.endsWith(".flac") -> MimeTypes.AUDIO_FLAC
-                uriStr.endsWith(".wav") || uriStr.endsWith(".wave") -> MimeTypes.AUDIO_WAV
-                uriStr.endsWith(".opus") -> MimeTypes.AUDIO_OPUS
-                uriStr.endsWith(".mp3") -> MimeTypes.AUDIO_MPEG
-                else -> null
-            }
-            Pair(Uri.fromFile(localFile), mime)
-        } else if (!track.uriString.isNullOrBlank()) {
-            val uriStr = track.uriString.lowercase()
-            val parsedUri = if (track.uriString.startsWith("/")) {
-                Uri.fromFile(File(track.uriString))
-            } else {
-                Uri.parse(track.uriString)
-            }
-            val mime = when {
-                uriStr.endsWith(".wav") || uriStr.endsWith(".wave") -> MimeTypes.AUDIO_WAV
-                uriStr.endsWith(".flac") -> MimeTypes.AUDIO_FLAC
-                uriStr.endsWith(".mp3") -> MimeTypes.AUDIO_MPEG
-                else -> null
-            }
-            Pair(parsedUri, mime)
-        } else {
-            Pair(Uri.parse("https://stream.flowaudio.io/pending/${track.id}"), null)
-        }
-
-        val artworkUri = if (!track.artworkUrl.isNullOrBlank()) {
-            Uri.parse(AlbumArtHelper.enhanceArtworkUrl(track.artworkUrl))
-        } else if (isActiveTrack) {
-            AlbumArtHelper.getArtworkUri(context, track)
-        } else {
-            null
-        }
-
-        val metadataBuilder = MediaMetadata.Builder()
-            .setTitle(track.title)
-            .setArtist(track.artist)
-            .setAlbumTitle(track.album)
-            .setGenre(track.genre)
-            .setReleaseYear(track.releaseYear)
-            .setIsPlayable(true)
-
-        if (artworkUri != null) {
-            metadataBuilder.setArtworkUri(artworkUri)
-        }
-        if (isActiveTrack && track.artworkUrl.isNullOrBlank()) {
-            val artworkBytes = AlbumArtHelper.getArtworkByteArray(context, track)
-            metadataBuilder.setArtworkData(artworkBytes, MediaMetadata.PICTURE_TYPE_FRONT_COVER)
-        }
-
-        val item = MediaItem.Builder()
-            .setMediaId(track.id)
-            .setUri(uri)
-            .setMediaMetadata(metadataBuilder.build())
-
-        if (detectedMimeType != null) {
-            item.setMimeType(detectedMimeType)
-        }
-
-        return item.build()
     }
 
     fun toggleFavoriteCurrentTrack() {

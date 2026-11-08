@@ -40,10 +40,18 @@ data class AudioTrack(
     val isDownloaded: Boolean = false,
     val localFilePath: String? = null,
     val sourceProvider: String = "Flow Lossless",
-    val isrc: String? = null
+    val isrc: String? = null,
+    val canonicalIsrc: String? = isrc,
+    val streamUrl: String? = uriString
 ) {
     val isOfflineAvailable: Boolean
         get() = isDownloaded || isLocalImport || !localFilePath.isNullOrBlank()
+
+    val effectiveStreamUrl: String?
+        get() = streamUrl?.takeIf { it.isNotBlank() } ?: uriString?.takeIf { it.isNotBlank() }
+
+    val effectiveCanonicalIsrc: String?
+        get() = canonicalIsrc?.takeIf { it.isNotBlank() } ?: isrc?.takeIf { it.isNotBlank() }
 
     val fidelityBadge: String
         get() = "${format.displayName} ${bitDepth}B/${sampleRate / 1000}kHz"

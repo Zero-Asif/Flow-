@@ -1,1328 +1,717 @@
 package com.example.network
 
-import com.example.model.AudioFormat
 import com.example.model.AudioTrack
-import com.example.model.LyricLine
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import okhttp3.Call
+import okhttp3.Callback
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
-import java.net.URLEncoder
+import java.io.IOException
+import java.util.Locale
 import java.util.concurrent.TimeUnit
+import kotlin.coroutines.coroutineContext
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
+import kotlin.math.ln
 
-import com.example.util.AlbumArtHelper
+// ==========================================
+// 1. DATA MODELS & EXCEPTIONS
+// ==========================================
 
-enum class MusicSourceFilter(val displayName: String, val badgeLabel: String, val waterfallOrder: Int) {
-    ALL("All Sources", "Waterfall", 0),
-    AMAZON_MUSIC("Amazon Ultra HD", "Amazon HD", 1),
-    DEEZER("Deezer HiFi", "Deezer", 2),
-    TIDAL("Tidal Master", "Tidal", 3),
-    JIOSAAVN("JioSaavn 320k", "JioSaavn", 4),
-    YOUTUBE("YouTube Music", "YouTube", 5),
-    APPLE_AMAZON("Apple / Amazon", "Lossless", 1)
+class UnsupportedResponseException(message: String) : IOException(message)
+
+sealed class TopResultItem {
+    data class SongItem(val track: AudioTrack) : TopResultItem()
+    data class ArtistItem(val artist: ArtistResult) : TopResultItem()
+    data class AlbumItem(val album: AlbumResult) : TopResultItem()
+    data class PlaylistItem(val playlist: PlaylistResult) : TopResultItem()
 }
 
-data class SearchSuggestionsResult(
-    val queryCompletions: List<String> = emptyList(),
-    val topTracks: List<AudioTrack> = emptyList(),
-    val topArtists: List<String> = emptyList()
+data class SearchResultShelves(
+    val topResult: TopResultItem?,
+    val songs: List<AudioTrack>,
+    val artists: List<ArtistResult>,
+    val albums: List<AlbumResult>,
+    val playlists: List<PlaylistResult>
 )
 
-data class AlbumSearchSummary(
-    val title: String,
-    val artist: String,
-    val artworkUrl: String?,
-    val releaseYear: Int,
-    val representativeTrack: AudioTrack
-)
-
-data class ArtistSearchSummary(
+data class ArtistResult(
+    val browseId: String,
     val name: String,
-    val artworkUrl: String?,
-    val topGenre: String,
-    val representativeTrack: AudioTrack
+    val subscribers: String = "",
+    val thumbnail: String = ""
 )
 
-data class CategorizedSearchResults(
-    val bestMatch: AudioTrack? = null,
-    val songs: List<AudioTrack> = emptyList(),
-    val albums: List<AlbumSearchSummary> = emptyList(),
-    val artists: List<ArtistSearchSummary> = emptyList()
+data class AlbumResult(
+    val browseId: String,
+    val title: String,
+    val artist: String = "",
+    val year: String = "",
+    val thumbnail: String = "",
+    val type: String = "Album"
 )
 
-/**
- * Multi-Provider Waterfall Global Music Search Engine:
- * Queries providers and resolves streams in strict audiophile hierarchy order:
- * 1. Amazon Music (HD / Ultra HD - Up to 24-bit / 192kHz, ~4608 kbps FLAC)
- * 2. Deezer (HiFi Lossless FLAC - 16-bit / 44.1kHz, 1411 kbps)
- * 3. Tidal (HiFi / Master FLAC / ALAC - Up to 24-bit / 96kHz, 2822 kbps)
- * 4. JioSaavn (HQ 320kbps AAC / MP3 - Fallback only)
- * 5. YouTube Music (256kbps Opus / AAC - Last Resort Fallback)
- */
-object GlobalMusicSearchEngine {
+data class PlaylistResult(
+    val browseId: String,
+    val title: String,
+    val author: String = "",
+    val trackCount: String = "",
+    val thumbnail: String = ""
+)
 
-    private const val SEARCH_CALL_TAG = "global_search_call"
+private data class ScoredTrackCandidate(
+    val track: AudioTrack,
+    val playCount: Long,
+    val originalIndex: Int,
+    val isOfficial: Boolean
+)
 
-    private val httpClient: OkHttpClient = OkHttpClient.Builder()
+// ==========================================
+// 2. PRODUCTION SEARCH ENGINE IMPLEMENTATION
+// ==========================================
+
+class GlobalMusicSearchEngine(
+    private val client: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(10, TimeUnit.SECONDS)
+        .retryOnConnectionFailure(true)
         .build()
+) {
 
-    /**
-     * Aborts any in-flight OkHttp search requests when the user types a new search query.
-     */
-    fun cancelActiveSearchCalls() {
-        try {
-            for (call in httpClient.dispatcher.queuedCalls()) {
-                if (call.request().tag() == SEARCH_CALL_TAG) {
-                    call.cancel()
-                }
-            }
-            for (call in httpClient.dispatcher.runningCalls()) {
-                if (call.request().tag() == SEARCH_CALL_TAG) {
-                    call.cancel()
-                }
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
+    private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
+
+    private enum class EntityKind {
+        ARTIST,
+        ALBUM,
+        PLAYLIST,
+        UNKNOWN
     }
 
-    /**
-     * Returns the strict waterfall priority rank for a provider (higher is preferred):
-     * 1. Amazon Music (500) > 2. Deezer (400) > 3. Tidal (300) > 4. JioSaavn (200) > 5. YouTube Music (100)
-     */
-    fun providerWaterfallRank(sourceProvider: String?): Int {
-        val label = sourceProvider.orEmpty().lowercase()
-        return when {
-            label.contains("amazon") -> 500
-            label.contains("deezer") -> 400
-            label.contains("tidal") || label.contains("apple") -> 300
-            label.contains("saavn") || label.contains("jiosaavn") -> 200
-            label.contains("youtube") -> 100
-            else -> 50
-        }
-    }
-
-    /**
-     * Strictly sorts tracks by:
-     * 1. Bit Depth (24-bit > 16-bit)
-     * 2. Sample Rate (192kHz > 96kHz > 48kHz > 44.1kHz)
-     * 3. Bitrate (4608 kbps > 2822 kbps > 1411 kbps > 320 kbps > 256 kbps)
-     * 4. Lossless Codec Priority (FLAC > ALAC > WAV > AAC > OPUS > MP3)
-     * 5. Provider Waterfall Hierarchy (Amazon Music > Deezer > Tidal > JioSaavn > YouTube Music)
-     */
-    fun sortTracksByQualityCascade(tracks: List<AudioTrack>): List<AudioTrack> {
-        return tracks.sortedWith(
-            compareByDescending<AudioTrack> { it.format.isLossless }
-                .thenByDescending { it.bitDepth }
-                .thenByDescending { if (it.format.isLossless) it.sampleRate else it.bitrateKbps }
-                .thenByDescending { it.bitrateKbps }
-                .thenByDescending { it.sampleRate }
-                .thenByDescending { UniversalStreamResolver.codecPriorityRank(it.format.displayName) }
-                .thenByDescending { providerWaterfallRank(it.sourceProvider) }
-        )
-    }
-
-    private fun normalizeMatchKey(text: String): String {
-        return text
-            .lowercase()
-            .replace("&quot;", "\"")
-            .replace("&amp;", "&")
-            .replace("&#039;", "'")
-            .replace(Regex("""\([^)]*\)"""), "")
-            .replace(Regex("""\[[^]]*]"""), "")
-            .replace(Regex("""[^a-z0-9\s]"""), "")
-            .replace(Regex("""\s+"""), " ")
-            .trim()
-    }
-
-    /**
-     * Module 2: Advanced Relevance Ranking & Tokenization with Fuzzy Typo Tolerance & Popularity:
-     * Splits queries into individual tokens (e.g., "arefin", "rumey", "moner" or "arijit sing")
-     * and ranks by: Exact Phrase Match > Play Count / View Popularity > Prefix Match > Fuzzy Token Match > Release Year,
-     * while penalizing unverified covers, tributes, and karaoke versions.
-     */
-    fun computeSearchRelevanceScore(track: AudioTrack, query: String): Int {
-        val normQuery = normalizeMatchKey(query)
-        if (normQuery.isBlank()) return 100
-
-        // Penalize cover, karaoke, tribute, and slowed/reverb versions when user didn't ask for one
-        if (StreamMatcher.isDisqualifiedCoverOrRemix(track.title, track.artist, query)) {
-            return -500
+    suspend fun searchStructured(query: String): Result<SearchResultShelves> = withContext(Dispatchers.IO) {
+        val trimmedQuery = query.trim()
+        if (trimmedQuery.isEmpty()) {
+            return@withContext Result.success(emptyShelves())
         }
 
-        val normTitle = normalizeMatchKey(track.title)
-        val normArtist = normalizeMatchKey(track.artist)
-        val normAlbum = normalizeMatchKey(track.album)
-        val combined = "$normTitle $normArtist"
-
-        val queryTokens = normQuery.split(" ").filter { it.isNotBlank() }
-        val titleTokens = normTitle.split(" ").filter { it.isNotBlank() }
-        val artistTokens = normArtist.split(" ").filter { it.isNotBlank() }
-        val allTrackTokens = (titleTokens + artistTokens).distinct()
-
-        var score = 0
-
-        // 1. Exact Phrase Match (including official film soundtrack titles like "Aaj Ki Raat (From \"Stree 2\")")
-        if (normTitle == normQuery) {
-            score += 1000
-        } else if (combined == normQuery || "$normArtist $normTitle" == normQuery) {
-            score += 950
-        } else if (normTitle.startsWith(normQuery)) {
-            // 2. Prefix Match
-            score += 850
-        } else if (normArtist == normQuery || normArtist.startsWith(normQuery)) {
-            score += 750
-        } else if (normTitle.contains(normQuery)) {
-            score += 650
-        } else if (combined.contains(normQuery)) {
-            score += 600
-        }
-
-        // 3. Token-level & Fuzzy Typo Tolerance (e.g., "arijit sing" -> "arijit singh")
-        if (queryTokens.isNotEmpty()) {
-            var matchedTokens = 0.0
-            for (qTok in queryTokens) {
-                val bestTokSim = allTrackTokens.maxOfOrNull { tTok ->
-                    when {
-                        tTok == qTok -> 1.0
-                        tTok.startsWith(qTok) || qTok.startsWith(tTok) && qTok.length >= 3 -> 0.92
-                        qTok.length >= 4 && tTok.length >= 4 -> {
-                            val lev = UniversalStreamResolver.calculateLevenshteinSimilarity(qTok, tTok)
-                            if (lev >= 0.75) lev else 0.0
-                        }
-                        else -> 0.0
-                    }
-                } ?: 0.0
-                matchedTokens += bestTokSim
-            }
-            val tokenCoverage = matchedTokens / queryTokens.size.toDouble()
-            score += (tokenCoverage * 500.0).toInt()
-        }
-
-        // 4. Official Soundtrack / Original Motion Picture & Multi-Artist Credits Bonus
-        val rawTitleLower = track.title.lowercase()
-        if (rawTitleLower.contains("from \"") || rawTitleLower.contains("(from ") || track.artist.contains(",")) {
-            score += 80
-        }
-
-        // 5. View Count / Playback Popularity Boost (Descending)
-        val popularityBoost = when {
-            track.playCount >= 50_000_000 -> 450
-            track.playCount >= 10_000_000 -> 380
-            track.playCount >= 1_000_000 -> 300
-            track.playCount >= 100_000 -> 200
-            track.playCount >= 10_000 -> 100
-            track.playCount > 0 -> 40
-            else -> 0
-        }
-        score += popularityBoost
-
-        // 6. Album match bonus & Release Year tie-breaker
-        if (normAlbum == normQuery) score += 120
-        score += (track.releaseYear.coerceIn(1970, 2026) - 1970)
-
-        return score
-    }
-
-    /**
-     * Ranks tracks combining search relevance (exact/prefix/fuzzy token match), playback popularity (playCount),
-     * and audiophile quality cascade.
-     */
-    fun rankTracksByQueryAndQuality(tracks: List<AudioTrack>, query: String): List<AudioTrack> {
-        if (query.isBlank()) return sortTracksByQualityCascade(tracks)
-        return tracks.sortedWith(
-            compareByDescending<AudioTrack> { !StreamMatcher.isDisqualifiedCoverOrRemix(it.title, it.artist, query) }
-                .thenByDescending { computeSearchRelevanceScore(it, query) >= 450 }
-                .thenByDescending { computeSearchRelevanceScore(it, query) / 120 }
-                .thenByDescending { it.playCount }
-                .thenByDescending { it.format.isLossless }
-                .thenByDescending { it.bitDepth }
-                .thenByDescending { if (it.format.isLossless) it.sampleRate else it.bitrateKbps }
-                .thenByDescending { it.bitrateKbps }
-                .thenByDescending { computeSearchRelevanceScore(it, query) }
-                .thenByDescending { providerWaterfallRank(it.sourceProvider) }
-        )
-    }
-
-    /**
-     * Module 2.3: Clean Result Segregation into Best Match (Top Result), Songs, Albums, and Artists.
-     */
-    fun segregateSearchResults(tracks: List<AudioTrack>, query: String): CategorizedSearchResults {
-        if (tracks.isEmpty()) return CategorizedSearchResults()
-        val ranked = rankTracksByQueryAndQuality(tracks, query)
-        val bestMatch = ranked.firstOrNull()
-
-        val albums = ranked
-            .filter { it.album.isNotBlank() && !it.album.equals("Single", ignoreCase = true) }
-            .distinctBy { "${normalizeMatchKey(it.album)}_${normalizeMatchKey(it.artist)}" }
-            .take(8)
-            .map { track ->
-                AlbumSearchSummary(
-                    title = track.album,
-                    artist = track.artist,
-                    artworkUrl = AlbumArtHelper.enhanceArtworkUrl(track.artworkUrl),
-                    releaseYear = track.releaseYear,
-                    representativeTrack = track
-                )
-            }
-
-        val artists = ranked
-            .map { track ->
-                val primary = track.artist.split(",", "&", "feat.", "ft.").firstOrNull()?.trim() ?: track.artist
-                Pair(primary, track)
-            }
-            .filter { it.first.isNotBlank() && !it.first.equals("Unknown Artist", ignoreCase = true) }
-            .distinctBy { normalizeMatchKey(it.first) }
-            .take(8)
-            .map { (artistName, repTrack) ->
-                ArtistSearchSummary(
-                    name = artistName,
-                    artworkUrl = AlbumArtHelper.enhanceArtworkUrl(repTrack.artworkUrl),
-                    topGenre = repTrack.genre,
-                    representativeTrack = repTrack
-                )
-            }
-
-        return CategorizedSearchResults(
-            bestMatch = bestMatch,
-            songs = ranked,
-            albums = albums,
-            artists = artists
-        )
-    }
-
-    /**
-     * Module 2.1: Real-Time Typeahead & Autocomplete (Amazon / YouTube Music Standard):
-     * Returns Query Autocompletion phrases, Top Track Suggestions, and Top Artist Suggestions.
-     */
-    suspend fun fetchAutocompleteSuggestions(
-        query: String,
-        cachedResults: List<AudioTrack> = emptyList()
-    ): SearchSuggestionsResult = withContext(Dispatchers.IO) {
-        val trimmed = query.trim()
-        if (trimmed.isEmpty()) return@withContext SearchSuggestionsResult()
-
-        val completions = mutableListOf<String>()
-        try {
-            val encoded = URLEncoder.encode(trimmed, "UTF-8")
-            val suggestUrl = "https://suggestqueries.google.com/complete/search?client=firefox&ds=yt&q=$encoded"
-            val req = Request.Builder()
-                .url(suggestUrl)
-                .tag(SEARCH_CALL_TAG)
-                .header("User-Agent", "Mozilla/5.0 (Linux; Android 14; Mobile) FlowAudio/2.0")
-                .build()
-            httpClient.newCall(req).execute().use { resp ->
-                if (resp.isSuccessful) {
-                    val body = resp.body?.string().orEmpty()
-                    val outer = JSONArray(body)
-                    if (outer.length() > 1) {
-                        val arr = outer.optJSONArray(1)
-                        if (arr != null) {
-                            for (i in 0 until minOf(arr.length(), 6)) {
-                                val phrase = arr.optString(i, "").trim()
-                                if (phrase.isNotBlank()) completions.add(phrase)
-                            }
-                        }
-                    }
-                }
-            }
-        } catch (_: Exception) {
-            // Fallback to local completions if offline
-        }
-
-        val rankedTracks = if (cachedResults.isNotEmpty()) {
-            rankTracksByQueryAndQuality(cachedResults, trimmed)
-        } else {
-            emptyList()
-        }
-
-        val topTracks = rankedTracks.take(4)
-        val topArtists = rankedTracks
-            .map { it.artist.split(",", "&", "feat.", "ft.").firstOrNull()?.trim().orEmpty() }
-            .filter { it.isNotBlank() && !it.equals("Unknown Artist", ignoreCase = true) }
-            .distinctBy { it.lowercase() }
-            .take(5)
-
-        if (completions.isEmpty()) {
-            topTracks.forEach { t ->
-                completions.add("${t.title} ${t.artist}".trim())
-            }
-        }
-
-        SearchSuggestionsResult(
-            queryCompletions = completions.distinct().take(6),
-            topTracks = topTracks,
-            topArtists = topArtists
-        )
-    }
-
-    /**
-     * Module 1: Strict Audio Matching Engine for Direct Stream Hydration
-     * Computes Multi-Factor Identity Confidence Score (0-100%) and ONLY binds a direct stream URL
-     * if confidence >= HARD_MATCH_THRESHOLD, title-artist verification passes, and duration is within ±3 seconds.
-     */
-    private fun findMatchingDirectStream(
-        candidate: AudioTrack,
-        streamPool: List<AudioTrack>
-    ): String? {
-        if (!candidate.uriString.isNullOrBlank()) return candidate.uriString
-        val targetDurationSec = (candidate.durationMs / 1000L).coerceAtLeast(0L)
-
-        var bestUri: String? = null
-        var bestConfidence = 0
-
-        for (poolTrack in streamPool) {
-            val streamUri = poolTrack.uriString
-            if (streamUri.isNullOrBlank()) continue
-            if (StreamMatcher.isDisqualifiedCoverOrRemix(poolTrack.title, poolTrack.artist, candidate.title)) continue
-
-            // Enforce ±3 second duration sanity check when both durations are known
-            if (candidate.durationMs > 10_000L && poolTrack.durationMs > 10_000L) {
-                if (!StreamMatcher.isDurationValid(poolTrack.durationMs, candidate.durationMs)) {
-                    continue
-                }
-            }
-
-            val poolDurationSec = (poolTrack.durationMs / 1000L).coerceAtLeast(0L)
-            val confidence = UniversalStreamResolver.computeMatchConfidenceScore(
-                candidateTitle = poolTrack.title,
-                candidateArtist = poolTrack.artist,
-                targetTitle = candidate.title,
-                targetArtist = candidate.artist,
-                durationSec = poolDurationSec,
-                targetDurationSec = targetDurationSec
-            )
-
-            if (confidence >= UniversalStreamResolver.HARD_MATCH_THRESHOLD && confidence > bestConfidence) {
-                bestConfidence = confidence
-                bestUri = streamUri
-            }
-        }
-        return bestUri
-    }
-
-    suspend fun searchAllSources(
-        query: String,
-        filter: MusicSourceFilter = MusicSourceFilter.ALL,
-        limit: Int = 30
-    ): List<AudioTrack> = withContext(Dispatchers.IO) {
-        if (query.isBlank()) return@withContext emptyList()
-
-        when (filter) {
-            MusicSourceFilter.AMAZON_MUSIC, MusicSourceFilter.APPLE_AMAZON -> {
-                val amazonDeferred = async { searchAmazonMusic(query, limit) }
-                val saavnDeferred = async { searchJioSaavn(query, limit) }
-                val amazon = amazonDeferred.await()
-                val saavn = saavnDeferred.await()
-                val hydrated = amazon.map { track ->
-                    val directStream = findMatchingDirectStream(track, saavn)
-                    if (directStream != null) track.copy(uriString = directStream) else track
-                }
-                rankTracksByQueryAndQuality(hydrated, query)
-            }
-            MusicSourceFilter.DEEZER -> {
-                val deezerDeferred = async { searchDeezer(query, limit) }
-                val saavnDeferred = async { searchJioSaavn(query, limit) }
-                val deezer = deezerDeferred.await()
-                val saavn = saavnDeferred.await()
-                val hydrated = deezer.map { track ->
-                    val directStream = findMatchingDirectStream(track, saavn)
-                    if (directStream != null) track.copy(uriString = directStream) else track
-                }
-                rankTracksByQueryAndQuality(hydrated, query)
-            }
-            MusicSourceFilter.TIDAL -> {
-                val tidalDeferred = async { searchTidal(query, limit) }
-                val saavnDeferred = async { searchJioSaavn(query, limit) }
-                val tidal = tidalDeferred.await()
-                val saavn = saavnDeferred.await()
-                val hydrated = tidal.map { track ->
-                    val directStream = findMatchingDirectStream(track, saavn)
-                    if (directStream != null) track.copy(uriString = directStream) else track
-                }
-                rankTracksByQueryAndQuality(hydrated, query)
-            }
-            MusicSourceFilter.JIOSAAVN -> rankTracksByQueryAndQuality(searchJioSaavn(query, limit), query)
-            MusicSourceFilter.YOUTUBE -> rankTracksByQueryAndQuality(searchYouTubeMusic(query, limit), query)
-            MusicSourceFilter.ALL -> {
-                val ytDeferred = async { searchYouTubeMusic(query, limit) }
-                val saavnDeferred = async { searchJioSaavn(query, limit) }
-                val amazonDeferred = async { searchAmazonMusic(query, limit) }
-                val deezerDeferred = async { searchDeezer(query, limit) }
-                val tidalDeferred = async { searchTidal(query, limit) }
-
-                val yt = ytDeferred.await()
-                val saavn = saavnDeferred.await()
-                val amazon = amazonDeferred.await()
-                val deezer = deezerDeferred.await()
-                val tidal = tidalDeferred.await()
-
-                // 1. Canonical Metadata Lookup:
-                // Filter and rank candidates from YouTube Music & JioSaavn by View Count / Playback Popularity (Descending)
-                // so the official original soundtrack (e.g., "Aaj Ki Raat" from "Stree 2") always wins over cover artists.
-                val popularityPool = (saavn + yt).filter { track ->
-                    !StreamMatcher.isDisqualifiedCoverOrRemix(track.title, track.artist, query) &&
-                        computeSearchRelevanceScore(track, query) >= 250
-                }
-                val topPopularTrack = popularityPool.maxWithOrNull(
-                    compareBy<AudioTrack> { it.playCount }
-                        .thenBy { computeSearchRelevanceScore(it, query) }
-                ) ?: yt.firstOrNull() ?: saavn.firstOrNull()
-
-                // Extract canonical ISRC, Title, Primary Artist, and Exact Duration (ms) via StreamMatcher
-                val canonicalMetadata = if (topPopularTrack != null) {
-                    StreamMatcher.resolveCanonicalTrack(
-                        rawTitle = topPopularTrack.title,
-                        rawArtist = topPopularTrack.artist,
-                        fallbackDurationMs = topPopularTrack.durationMs
-                    )
-                } else null
-
-                val canonicalRefTitle = canonicalMetadata?.canonicalTitle ?: topPopularTrack?.title.orEmpty()
-                val canonicalRefArtist = canonicalMetadata?.primaryArtist ?: topPopularTrack?.artist.orEmpty()
-                val canonicalRefDurationMs = canonicalMetadata?.durationMs ?: topPopularTrack?.durationMs ?: 0L
-                val maxObservedPlayCount = maxOf(topPopularTrack?.playCount ?: 0, 1_000_000)
-
-                // Helper that enforces title-artist verification, rejects covers/tributes, and rejects duration discrepancy > ±3s
-                val matchesCanonicalOriginal: (AudioTrack) -> Boolean = { candidate ->
-                    !StreamMatcher.isDisqualifiedCoverOrRemix(candidate.title, candidate.artist, query) &&
-                        StreamMatcher.isDurationValid(candidate.durationMs, canonicalRefDurationMs) &&
-                        UniversalStreamResolver.computeMatchConfidenceScore(
-                            candidateTitle = candidate.title,
-                            candidateArtist = candidate.artist,
-                            targetTitle = canonicalRefTitle,
-                            targetArtist = canonicalRefArtist,
-                            durationSec = candidate.durationMs / 1000L,
-                            targetDurationSec = canonicalRefDurationMs / 1000L
-                        ) >= 75
-                }
-
-                // 2. Resolve canonical track through Lossless Waterfall: Amazon Ultra HD -> Deezer HiFi -> Tidal Master -> JioSaavn -> YouTube Music
-                val canonicalMaster = if (topPopularTrack != null) {
-                    amazon.firstOrNull(matchesCanonicalOriginal)
-                        ?: deezer.firstOrNull(matchesCanonicalOriginal)
-                        ?: tidal.firstOrNull(matchesCanonicalOriginal)
-                        ?: saavn.firstOrNull(matchesCanonicalOriginal)
-                        ?: topPopularTrack
-                } else null
-
-                val canonicalDirectStream = if (canonicalMaster != null) {
-                    findMatchingDirectStream(canonicalMaster, saavn) ?: topPopularTrack?.uriString
-                } else null
-                val hydratedCanonical = canonicalMaster?.copy(
-                    uriString = canonicalMaster.uriString ?: canonicalDirectStream,
-                    playCount = maxOf(canonicalMaster.playCount, maxObservedPlayCount)
-                )
-
-                // Strict Provider Waterfall Order: Amazon Music -> Deezer -> Tidal -> JioSaavn -> YouTube Music
-                // Filter out cover/tribute tracks when user did not explicitly search for a cover
-                val waterfallCandidates = (amazon + deezer + tidal + saavn + yt).filter { candidate ->
-                    !StreamMatcher.isDisqualifiedCoverOrRemix(candidate.title, candidate.artist, query)
-                }
-                val merged = mutableListOf<AudioTrack>()
-
-                for (candidate in waterfallCandidates) {
-                    val directStreamUrl = findMatchingDirectStream(candidate, saavn)
-                    val matchingSaavnPlayCount = saavn.firstOrNull {
-                        normalizeMatchKey(it.title) == normalizeMatchKey(candidate.title) &&
-                            StreamMatcher.isDurationValid(it.durationMs, candidate.durationMs)
-                    }?.playCount ?: 0
-                    val hydratedCandidate = candidate.copy(
-                        uriString = candidate.uriString ?: directStreamUrl,
-                        playCount = maxOf(candidate.playCount, matchingSaavnPlayCount)
-                    )
-
-                    val normTitle = normalizeMatchKey(hydratedCandidate.title)
-                    val normArtist = normalizeMatchKey(
-                        hydratedCandidate.artist.split(",", "&", "feat", "ft").firstOrNull().orEmpty()
-                    )
-
-                    val existingIdx = merged.indexOfFirst { existing ->
-                        normalizeMatchKey(existing.title) == normTitle &&
-                            (normArtist.isBlank() ||
-                                normalizeMatchKey(existing.artist).contains(normArtist) ||
-                                normArtist.contains(
-                                    normalizeMatchKey(existing.artist.split(",", "&").firstOrNull().orEmpty())
-                                ))
-                    }
-
-                    if (existingIdx == -1) {
-                        merged.add(hydratedCandidate)
-                    } else {
-                        val existing = merged[existingIdx]
-                        val combinedUri = existing.uriString ?: hydratedCandidate.uriString
-                        val combinedPlayCount = maxOf(existing.playCount, hydratedCandidate.playCount)
-                        val candidateIsHigher = when {
-                            hydratedCandidate.bitDepth != existing.bitDepth ->
-                                hydratedCandidate.bitDepth > existing.bitDepth
-                            hydratedCandidate.sampleRate != existing.sampleRate ->
-                                hydratedCandidate.sampleRate > existing.sampleRate
-                            hydratedCandidate.bitrateKbps != existing.bitrateKbps ->
-                                hydratedCandidate.bitrateKbps > existing.bitrateKbps
-                            hydratedCandidate.format.isLossless != existing.format.isLossless ->
-                                hydratedCandidate.format.isLossless
-                            else -> providerWaterfallRank(hydratedCandidate.sourceProvider) >
-                                providerWaterfallRank(existing.sourceProvider)
-                        }
-
-                        if (candidateIsHigher) {
-                            merged[existingIdx] = hydratedCandidate.copy(
-                                uriString = combinedUri,
-                                playCount = combinedPlayCount
-                            )
-                        } else {
-                            merged[existingIdx] = existing.copy(
-                                uriString = combinedUri ?: existing.uriString,
-                                playCount = combinedPlayCount
-                            )
-                        }
-                    }
-                }
-
-                val ranked = rankTracksByQueryAndQuality(merged, query)
-
-                // Place canonical masterpiece at index 0 of search results for guaranteed Top Result Best Match
-                if (hydratedCanonical != null) {
-                    val normCanonical = normalizeMatchKey(hydratedCanonical.title)
-                    val normCanonicalArt = normalizeMatchKey(
-                        hydratedCanonical.artist.split(",", "&", "feat", "ft").firstOrNull().orEmpty()
-                    )
-                    val existingIdx = ranked.indexOfFirst {
-                        normalizeMatchKey(it.title) == normCanonical &&
-                            (normCanonicalArt.isBlank() || normalizeMatchKey(it.artist).contains(normCanonicalArt))
-                    }
-                    if (existingIdx > 0) {
-                        val matchedTrack = ranked[existingIdx].copy(
-                            playCount = maxOf(ranked[existingIdx].playCount, hydratedCanonical.playCount),
-                            uriString = ranked[existingIdx].uriString ?: hydratedCanonical.uriString
-                        )
-                        listOf(matchedTrack) + ranked.filterIndexed { index, _ -> index != existingIdx }
-                    } else if (existingIdx == 0) {
-                        ranked
-                    } else {
-                        listOf(hydratedCanonical) + ranked
-                    }
-                } else {
-                    ranked
-                }
-            }
-        }
-    }
-
-    suspend fun searchGlobalSongs(query: String, limit: Int = 30): List<AudioTrack> {
-        return searchAllSources(query, MusicSourceFilter.ALL, limit)
-    }
-
-    suspend fun searchJioSaavn(query: String, limit: Int = 30): List<AudioTrack> = withContext(Dispatchers.IO) {
-        val results = mutableListOf<AudioTrack>()
-        val encodedQuery = URLEncoder.encode(query.trim(), "UTF-8")
-
-        // 1. Primary: Official JioSaavn Direct API v4 with native DES decryption (Zero 429 rate limits!)
-        try {
-            val officialUrl =
-                "https://www.jiosaavn.com/api.php?__call=search.getResults&_format=json&_marker=0&api_version=4&ctx=web6dot0&n=$limit&p=1&q=$encodedQuery"
-            val request = Request.Builder()
-                .url(officialUrl)
-                .tag(SEARCH_CALL_TAG)
-                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-                .header("Referer", "https://www.jiosaavn.com/")
-                .build()
-
-            val response = httpClient.newCall(request).execute()
-            if (response.isSuccessful) {
-                val bodyString = response.body?.string().orEmpty()
-                val json = JSONObject(bodyString)
-                val dataNode = json.optJSONObject("data")
-                val items = json.optJSONArray("results")
-                    ?: dataNode?.optJSONArray("results")
-                    ?: json.optJSONArray("songs")
-                    ?: dataNode?.optJSONArray("songs")
-                    ?: json.optJSONArray("tracks")
-                    ?: dataNode?.optJSONArray("tracks")
-
-                if (items != null && items.length() > 0) {
-                    for (i in 0 until items.length()) {
-                        val item = items.getJSONObject(i)
-                        val songId = item.optString("id", "").ifBlank { "idx_$i" }
-                        val rawTitle = item.optString("title", "")
-                            .ifBlank { item.optString("song", "") }
-                            .ifBlank { item.optString("name", "") }
-                        val title = rawTitle
-                            .replace("&quot;", "\"")
-                            .replace("&amp;", "&")
-                            .replace("&#039;", "'")
-                            .trim()
-                        val moreInfo = item.optJSONObject("more_info")
-                        val albumName = (moreInfo?.optString("album", "")?.ifBlank { null }
-                            ?: item.optString("album", "Single"))
-                            .replace("&quot;", "\"")
-                            .replace("&amp;", "&")
-                        val durationSec = (moreInfo?.optString("duration", "")?.toLongOrNull()
-                            ?: item.optLong("duration", 210L)).coerceAtLeast(60L)
-                        val year = item.optString("year", "2025").toIntOrNull() ?: 2025
-                        val playCount = (item.optString("play_count", "").toLongOrNull()
-                            ?: moreInfo?.optString("play_count", "")?.toLongOrNull()
-                            ?: item.optLong("play_count", 0L))
-                            .coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
-
-                        // Extract primary artists from artistMap
-                        var artist = ""
-                        val artistMap = moreInfo?.optJSONObject("artistMap")
-                        val primaryArr = artistMap?.optJSONArray("primary_artists")
-                        if (primaryArr != null && primaryArr.length() > 0) {
-                            val names = mutableListOf<String>()
-                            for (aIdx in 0 until primaryArr.length()) {
-                                val aName = primaryArr.getJSONObject(aIdx).optString("name", "")
-                                    .replace("&amp;", "&")
-                                if (aName.isNotBlank()) names.add(aName)
-                            }
-                            artist = names.joinToString(", ")
-                        }
-                        if (artist.isBlank()) {
-                            artist = (moreInfo?.optString("music", "")?.ifBlank { null }
-                                ?: item.optString("subtitle", "Unknown Artist").substringBefore("-")).trim()
-                        }
-                        if (artist.isBlank()) artist = "Unknown Artist"
-
-                        // Upgrade artwork to 500x500 HD
-                        val rawImage = item.optString("image", "")
-                        val highResArtwork = AlbumArtHelper.enhanceArtworkUrl(rawImage)
-
-                        // Decrypt encrypted_media_url directly into master stream URL
-                        val encryptedMediaUrl = moreInfo?.optString("encrypted_media_url", "")
-                            ?.ifBlank { null }
-                            ?: item.optString("encrypted_media_url", "")
-                        val has320 = moreInfo?.optString("320kbps", "true")?.toBoolean() ?: true
-                        val streamUrl = UniversalStreamResolver.decryptJioSaavnMediaUrl(encryptedMediaUrl, has320)
-
-                        // Derive real technical stream metadata from actual stream URL and API capabilities
-                        val isDolbyOrMaster = moreInfo?.optString("is_dolby_content", "false")?.toBoolean() == true ||
-                            streamUrl?.endsWith(".flac", ignoreCase = true) == true
-                        val fmt = when {
-                            isDolbyOrMaster -> AudioFormat.FLAC
-                            else -> AudioFormat.AAC
-                        }
-                        val sr = if (isDolbyOrMaster) 96000 else 44100
-                        val bd = if (isDolbyOrMaster) 24 else 16
-                        val br = when {
-                            isDolbyOrMaster -> 2822
-                            has320 || streamUrl?.contains("_320.") == true -> 320
-                            streamUrl?.contains("_160.") == true -> 160
-                            else -> 160
-                        }
-
-                        if (title.isNotBlank() && results.none { it.id == "saavn_$songId" }) {
-                            val sizeEst = UniversalStreamResolver.estimateFileSizeMb(durationSec * 1000L, br)
-                            results.add(
-                                AudioTrack(
-                                    id = "saavn_$songId",
-                                    title = title,
-                                    artist = artist,
-                                    album = albumName,
-                                    durationMs = durationSec * 1000L,
-                                    format = fmt,
-                                    sampleRate = sr,
-                                    bitDepth = bd,
-                                    bitrateKbps = br,
-                                    genre = "Global Stream",
-                                    releaseYear = year,
-                                    gradientColors = listOf(0xFF00F0FF, 0xFF7928CA),
-                                    uriString = streamUrl,
-                                    artworkUrl = highResArtwork,
-                                    isGlobalOnline = true,
-                                    playCount = playCount,
-                                    sourceProvider = if (fmt.isLossless) "Hi-Res ${fmt.displayName}" else "JioSaavn ${br}k",
-                                    fileSizeFormatted = "$sizeEst ($br kbps ${fmt.displayName})",
-                                    lyrics = listOf(
-                                        LyricLine(1000L, "♪ $title"),
-                                        LyricLine(6000L, "♪ $artist"),
-                                        LyricLine(12000L, "♪ $albumName")
-                                    )
-                                )
-                            )
-                        }
-                    }
-                    if (results.isNotEmpty()) return@withContext results
-                }
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-
-        // 2. Fallback: Secondary JioSaavn Mirror API
-        try {
-            val saavnUrls = listOf(
-                "https://saavn.sumit.co/api/search/songs?query=$encodedQuery&limit=$limit",
-                "https://saavn.dev/api/search/songs?query=$encodedQuery&limit=$limit"
-            )
-
-            for (saavnUrl in saavnUrls) {
-                try {
-                    val request = Request.Builder()
-                        .url(saavnUrl)
-                        .tag(SEARCH_CALL_TAG)
-                        .header("User-Agent", "Mozilla/5.0 (Linux; Android 14; Mobile) FlowAudio/2.0")
-                        .build()
-
-                    val response = httpClient.newCall(request).execute()
-                    if (response.isSuccessful) {
-                        val bodyString = response.body?.string().orEmpty()
-                        val json = JSONObject(bodyString)
-                        val dataObj = json.optJSONObject("data") ?: json
-                        val items = dataObj.optJSONArray("results")
-                        if (items != null && items.length() > 0) {
-                            for (i in 0 until items.length()) {
-                                val item = items.getJSONObject(i)
-                                val songId = item.optString("id", "")
-                                val title = item.optString("name", "")
-                                    .replace("&quot;", "\"")
-                                    .replace("&amp;", "&")
-                                    .replace("&#039;", "'")
-
-                                var artist = item.optString("primaryArtists", "").replace("&amp;", "&")
-                                if (artist.isBlank()) {
-                                    val artistsObj = item.optJSONObject("artists")
-                                    val primaryArr = artistsObj?.optJSONArray("primary")
-                                    if (primaryArr != null && primaryArr.length() > 0) {
-                                        val names = mutableListOf<String>()
-                                        for (aIdx in 0 until primaryArr.length()) {
-                                            val aName = primaryArr.getJSONObject(aIdx).optString("name", "")
-                                            if (aName.isNotBlank()) names.add(aName)
-                                        }
-                                        artist = names.joinToString(", ")
-                                    }
-                                }
-                                if (artist.isBlank()) artist = "Unknown Artist"
-
-                                val albumObj = item.optJSONObject("album")
-                                val albumName = albumObj?.optString("name", "Single")
-                                    ?.replace("&quot;", "\"")
-                                    ?.replace("&amp;", "&") ?: "Single"
-                                val durationSec = item.optLong("duration", 210L).coerceAtLeast(60L)
-                                val year = item.optString("year", "2024").toIntOrNull() ?: 2024
-                                val playCount = (item.optString("playCount", "").toLongOrNull()
-                                    ?: item.optLong("playCount", 0L))
-                                    .coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
-
-                                var highResArtwork = ""
-                                val images = item.optJSONArray("image")
-                                if (images != null) {
-                                    for (j in 0 until images.length()) {
-                                        val img = images.getJSONObject(j)
-                                        val imgUrl = img.optString("url", "").ifBlank { img.optString("link", "") }
-                                        if (img.optString("quality") == "500x500" || highResArtwork.isBlank()) {
-                                            highResArtwork = imgUrl
-                                        }
-                                    }
-                                }
-
-                                var streamUrl = ""
-                                var bitrate = 0
-                                val downloadUrls = item.optJSONArray("downloadUrl")
-                                if (downloadUrls != null) {
-                                    for (j in 0 until downloadUrls.length()) {
-                                        val d = downloadUrls.getJSONObject(j)
-                                        val quality = d.optString("quality", "")
-                                        val url = d.optString("url", "").ifBlank { d.optString("link", "") }
-                                        if (url.isNotBlank()) {
-                                            val qBitrate = quality.filter { it.isDigit() }.toIntOrNull() ?: 128
-                                            if (qBitrate >= bitrate) {
-                                                bitrate = qBitrate
-                                                streamUrl = url
-                                            }
-                                        }
-                                    }
-                                }
-                                if (streamUrl.contains("saavncdn.com")) {
-                                    streamUrl = UniversalStreamResolver.upgradeToHighestQualityUrl(streamUrl)
-                                    bitrate = 320
-                                }
-
-                                if (title.isNotBlank() && streamUrl.isNotBlank() && results.none { it.id == "saavn_$songId" }) {
-                                    results.add(
-                                        AudioTrack(
-                                            id = "saavn_$songId",
-                                            title = title,
-                                            artist = artist,
-                                            album = albumName,
-                                            durationMs = durationSec * 1000L,
-                                            format = AudioFormat.AAC,
-                                            sampleRate = 44100,
-                                            bitDepth = 16,
-                                            bitrateKbps = bitrate.coerceAtLeast(320),
-                                            genre = "Global Stream",
-                                            releaseYear = year,
-                                            gradientColors = listOf(0xFF00F0FF, 0xFF7928CA),
-                                            uriString = streamUrl,
-                                            artworkUrl = highResArtwork,
-                                            isGlobalOnline = true,
-                                            playCount = playCount,
-                                            sourceProvider = "JioSaavn 320k",
-                                            fileSizeFormatted = "${(320 * durationSec / 8 / 1024).coerceAtLeast(4)} MB (Full 320k Stream)",
-                                            lyrics = listOf(
-                                                LyricLine(1000L, "♪ $title"),
-                                                LyricLine(6000L, "♪ $artist"),
-                                                LyricLine(12000L, "♪ $albumName")
-                                            )
-                                        )
-                                    )
-                                }
-                            }
-                            if (results.isNotEmpty()) break
-                        }
-                    }
-                } catch (e: Exception) {
-                    // Try next endpoint
-                }
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-        results
-    }
-
-    /**
-     * Direct YouTube Music InnerTube API (`music.youtube.com/youtubei/v1/search`)
-     * with Songs filter (`EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D`) for 100% reliable YouTube Music search!
-     */
-    suspend fun searchYouTubeMusic(query: String, limit: Int = 20): List<AudioTrack> = withContext(Dispatchers.IO) {
-        val tracks = mutableListOf<AudioTrack>()
-        try {
-            val payloadJson = JSONObject().apply {
-                put("context", JSONObject().apply {
-                    put("client", JSONObject().apply {
-                        put("clientName", "WEB_REMIX")
-                        put("clientVersion", "1.20240717.01.00")
-                        put("hl", "en")
-                        put("gl", "US")
-                    })
+        val payload = JSONObject().apply {
+            put("context", JSONObject().apply {
+                put("client", JSONObject().apply {
+                    put("clientName", "WEB_REMIX")
+                    put("clientVersion", "1.20261021.01.00")
+                    put("hl", "en")
+                    put("gl", "US")
                 })
-                put("query", query.trim())
-                put("params", "EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D")
+            })
+            put("query", trimmedQuery)
+        }
+
+        val request = Request.Builder()
+            .url("https://music.youtube.com/youtubei/v1/search")
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0")
+            .header("Referer", "https://music.youtube.com/")
+            .header("Origin", "https://music.youtube.com")
+            .header("Accept", "application/json")
+            .post(payload.toString().toRequestBody(jsonMediaType))
+            .build()
+
+        try {
+            coroutineContext.ensureActive()
+
+            val rawJson = executeAsyncCancellable(client, request)
+
+            coroutineContext.ensureActive()
+            val shelves = parseYtmSearchResponse(rawJson, trimmedQuery)
+            Result.success(shelves)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    private suspend fun executeAsyncCancellable(
+        client: OkHttpClient,
+        request: Request
+    ): String {
+        return suspendCancellableCoroutine { continuation ->
+            val call = client.newCall(request)
+
+            continuation.invokeOnCancellation {
+                call.cancel()
             }
 
-            val reqBody = payloadJson.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
-            val request = Request.Builder()
-                .url("https://music.youtube.com/youtubei/v1/search?prettyPrint=false")
-                .post(reqBody)
-                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-                .build()
-
-            val response = httpClient.newCall(request).execute()
-            if (response.isSuccessful) {
-                val body = response.body?.string().orEmpty()
-                val root = JSONObject(body)
-                val renderers = mutableListOf<JSONObject>()
-                collectMusicResponsiveItems(root, renderers)
-
-                for (renderer in renderers.take(limit)) {
-                    val videoId = renderer.optJSONObject("playlistItemData")?.optString("videoId", "").orEmpty()
-                    if (videoId.isBlank()) continue
-
-                    val flexCols = renderer.optJSONArray("flexColumns") ?: continue
-                    var title = ""
-                    var artist = "YouTube Music Artist"
-                    var album = "YouTube Music Master"
-                    var durationSec = 210L
-
-                    if (flexCols.length() > 0) {
-                        val runs0 = flexCols.getJSONObject(0)
-                            .optJSONObject("musicResponsiveListItemFlexColumnRenderer")
-                            ?.optJSONObject("text")
-                            ?.optJSONArray("runs")
-                        if (runs0 != null && runs0.length() > 0) {
-                            title = runs0.getJSONObject(0).optString("text", "")
+            call.enqueue(object : Callback {
+                override fun onResponse(call: Call, response: Response) {
+                    try {
+                        val bodyString = response.use { res ->
+                            if (!res.isSuccessful) {
+                                throw IOException("YouTube Music HTTP error: ${res.code}")
+                            }
+                            res.body?.string() ?: throw IOException("Empty response body from YouTube Music")
+                        }
+                        if (continuation.isActive) {
+                            continuation.resume(bodyString)
+                        }
+                    } catch (e: Exception) {
+                        if (continuation.isActive) {
+                            continuation.resumeWithException(e)
                         }
                     }
+                }
 
-                    if (flexCols.length() > 1) {
-                        val runs1 = flexCols.getJSONObject(1)
-                            .optJSONObject("musicResponsiveListItemFlexColumnRenderer")
-                            ?.optJSONObject("text")
-                            ?.optJSONArray("runs")
-                        if (runs1 != null) {
-                            val parts = mutableListOf<String>()
-                            for (rIdx in 0 until runs1.length()) {
-                                val t = runs1.getJSONObject(rIdx).optString("text", "").trim()
-                                if (t.isNotBlank() && t != "•") parts.add(t)
-                            }
-                            if (parts.isNotEmpty()) artist = parts[0]
-                            if (parts.size >= 2 && !parts[1].contains(":")) album = parts[1]
-                            val timeStr = parts.lastOrNull { it.contains(":") }
-                            if (timeStr != null) {
-                                val minSec = timeStr.split(":")
-                                if (minSec.size == 2) {
-                                    val m = minSec[0].toLongOrNull() ?: 3L
-                                    val s = minSec[1].toLongOrNull() ?: 30L
-                                    durationSec = (m * 60L + s).coerceAtLeast(60L)
-                                }
-                            }
-                        }
+                override fun onFailure(call: Call, e: IOException) {
+                    if (continuation.isActive) {
+                        continuation.resumeWithException(e)
                     }
+                }
+            })
+        }
+    }
 
-                    var viewCount = 0L
-                    for (cIdx in 1 until flexCols.length()) {
-                        val colRuns = flexCols.getJSONObject(cIdx)
-                            .optJSONObject("musicResponsiveListItemFlexColumnRenderer")
-                            ?.optJSONObject("text")
-                            ?.optJSONArray("runs")
-                        if (colRuns != null) {
-                            for (r in 0 until colRuns.length()) {
-                                val txt = colRuns.getJSONObject(r).optString("text", "").trim()
-                                val parsed = parsePopularityViewCount(txt)
-                                if (parsed > viewCount) viewCount = parsed
-                            }
-                        }
-                    }
+    private suspend fun parseYtmSearchResponse(rawJson: String, originalQuery: String): SearchResultShelves {
+        val root = JSONObject(rawJson)
 
-                    var thumbnail = ""
-                    val thumbs = renderer.optJSONObject("thumbnail")
-                        ?.optJSONObject("musicThumbnailRenderer")
-                        ?.optJSONObject("thumbnail")
-                        ?.optJSONArray("thumbnails")
-                    if (thumbs != null && thumbs.length() > 0) {
-                        thumbnail = AlbumArtHelper.enhanceArtworkUrl(thumbs.getJSONObject(thumbs.length() - 1).optString("url", ""))
-                    }
+        val songsCandidates = mutableListOf<ScoredTrackCandidate>()
+        val artistsList = mutableListOf<ArtistResult>()
+        val albumsList = mutableListOf<AlbumResult>()
+        val playlistsList = mutableListOf<PlaylistResult>()
+        var topResultCandidate: TopResultItem? = null
+        var globalSongIndex = 0
 
-                    if (title.isNotBlank() && tracks.none { it.id == "yt_$videoId" }) {
-                        val sizeEst = UniversalStreamResolver.estimateFileSizeMb(durationSec * 1000L, 256)
-                        tracks.add(
-                            AudioTrack(
-                                id = "yt_$videoId",
-                                title = title,
-                                artist = artist,
-                                album = album,
-                                durationMs = durationSec * 1000L,
-                                format = AudioFormat.AAC,
-                                sampleRate = 48000,
-                                bitDepth = 16,
-                                bitrateKbps = 256,
-                                genre = "YouTube Music",
-                                releaseYear = 2025,
-                                gradientColors = listOf(0xFFFF0033, 0xFF7928CA),
-                                uriString = null,
-                                artworkUrl = thumbnail,
-                                isGlobalOnline = true,
-                                playCount = viewCount.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
-                                sourceProvider = "YouTube Music 256k",
-                                fileSizeFormatted = "$sizeEst (256 kbps Opus/AAC)",
-                                lyrics = listOf(
-                                    LyricLine(1000L, "♪ $title"),
-                                    LyricLine(6000L, "♪ $artist"),
-                                    LyricLine(12000L, "♪ $album")
-                                )
+        val tabs = root.optJSONObject("contents")
+            ?.optJSONObject("tabbedSearchResultsRenderer")
+            ?.optJSONArray("tabs")
+            ?: throw UnsupportedResponseException("Missing tabs in response")
+
+        val tabRenderer = (0 until tabs.length())
+            .mapNotNull { tabs.optJSONObject(it)?.optJSONObject("tabRenderer") }
+            .firstOrNull { it.optBoolean("selected", false) }
+            ?: tabs.optJSONObject(0)?.optJSONObject("tabRenderer")
+            ?: throw UnsupportedResponseException("No valid search tab found")
+
+        val tabContent = tabRenderer.optJSONObject("content")
+            ?.optJSONObject("sectionListRenderer")
+            ?.optJSONArray("contents")
+            ?: throw UnsupportedResponseException("Missing sectionListRenderer contents")
+
+        for (i in 0 until tabContent.length()) {
+            coroutineContext.ensureActive()
+            val sectionObj = tabContent.optJSONObject(i) ?: continue
+
+            // -------------------------------------------------------------
+            // 1. Handle Dedicated Top Card (musicCardShelfRenderer)
+            // -------------------------------------------------------------
+            if (sectionObj.has("musicCardShelfRenderer")) {
+                val card = sectionObj.getJSONObject("musicCardShelfRenderer")
+                val title = extractRunsText(card.optJSONObject("title")?.optJSONArray("runs"))
+                    .takeIf { it.isNotEmpty() }
+
+                val subtitleRuns = card.optJSONObject("subtitle")?.optJSONArray("runs") ?: JSONArray()
+                val subtitleInfo = parseAllColumns(subtitleRuns)
+                val thumbUrl = extractThumbnail(card.optJSONObject("thumbnail")?.optJSONObject("musicThumbnailRenderer"))
+
+                val cardNav = extractCardNavigation(card)
+                val watchVideoId = cardNav?.optJSONObject("watchEndpoint")?.optString("videoId") ?: ""
+                val browseEndpoint = cardNav?.optJSONObject("browseEndpoint")
+                val browseId = browseEndpoint?.optString("browseId") ?: ""
+                val pageType = browseEndpoint?.optJSONObject("browseEndpointContextSupportedConfigs")
+                    ?.optJSONObject("browseEndpointContextMusicConfig")?.optString("pageType") ?: ""
+
+                if (title != null) {
+                    when (classifyEntity(pageType, browseId, subtitleInfo.entityType, "")) {
+                        EntityKind.ARTIST -> {
+                            topResultCandidate = TopResultItem.ArtistItem(
+                                ArtistResult(browseId, title, subtitleInfo.subscribersText, thumbUrl)
                             )
+                        }
+                        EntityKind.ALBUM -> {
+                            topResultCandidate = TopResultItem.AlbumItem(
+                                AlbumResult(browseId, title, subtitleInfo.artist, subtitleInfo.year, thumbUrl, subtitleInfo.entityType.ifEmpty { "Album" })
+                            )
+                        }
+                        EntityKind.PLAYLIST -> {
+                            topResultCandidate = TopResultItem.PlaylistItem(
+                                PlaylistResult(browseId, title, subtitleInfo.author, subtitleInfo.trackCountText, thumbUrl)
+                            )
+                        }
+                        EntityKind.UNKNOWN -> {
+                            if (watchVideoId.isNotEmpty() && !isInstrumentalOrKaraoke(title, subtitleInfo.artist)) {
+                                topResultCandidate = TopResultItem.SongItem(
+                                    AudioTrack(
+                                        id = watchVideoId,
+                                        title = title,
+                                        artist = subtitleInfo.artist,
+                                        album = subtitleInfo.album,
+                                        durationMs = subtitleInfo.durationMs,
+                                        artworkUrl = thumbUrl,
+                                        streamUrl = ""
+                                    )
+                                )
+                            }
+                        }
+                    }
+                }
+
+                // Also parse sub-items inside card contents!
+                val cardContents = card.optJSONArray("contents")
+                if (cardContents != null) {
+                    for (c in 0 until cardContents.length()) {
+                        val itemRenderer = cardContents.optJSONObject(c)?.optJSONObject("musicResponsiveListItemRenderer") ?: continue
+                        parseResponsiveListItem(
+                            itemRenderer = itemRenderer,
+                            shelfTitle = "More from YouTube",
+                            songsCandidates = songsCandidates,
+                            artistsList = artistsList,
+                            albumsList = albumsList,
+                            playlistsList = playlistsList,
+                            indexProvider = { globalSongIndex++ }
                         )
                     }
                 }
+                continue
             }
-        } catch (e: Exception) {
-            e.printStackTrace()
+
+            // -------------------------------------------------------------
+            // 2. Handle Structured Shelves & itemSectionRenderer
+            // -------------------------------------------------------------
+            val shelfTitle: String
+            val items: JSONArray?
+
+            if (sectionObj.has("musicShelfRenderer")) {
+                val shelf = sectionObj.getJSONObject("musicShelfRenderer")
+                shelfTitle = extractRunsText(shelf.optJSONObject("title")?.optJSONArray("runs"))
+                items = shelf.optJSONArray("contents")
+            } else if (sectionObj.has("itemSectionRenderer")) {
+                val itemSection = sectionObj.getJSONObject("itemSectionRenderer")
+                shelfTitle = ""
+                items = itemSection.optJSONArray("contents")
+            } else {
+                continue
+            }
+
+            if (items == null) continue
+
+            for (j in 0 until items.length()) {
+                coroutineContext.ensureActive()
+                val itemRenderer = items.optJSONObject(j)?.optJSONObject("musicResponsiveListItemRenderer") ?: continue
+
+                parseResponsiveListItem(
+                    itemRenderer = itemRenderer,
+                    shelfTitle = shelfTitle,
+                    songsCandidates = songsCandidates,
+                    artistsList = artistsList,
+                    albumsList = albumsList,
+                    playlistsList = playlistsList,
+                    indexProvider = { globalSongIndex++ }
+                )
+            }
         }
-        tracks
+
+        // -------------------------------------------------------------
+        // 3. Balanced Scoring & Deduplication by Unique Video ID
+        // -------------------------------------------------------------
+        val rankedSongs = rankCandidatesBalanced(songsCandidates, originalQuery)
+            .distinctBy { it.id }
+
+        val finalTop = topResultCandidate ?: rankedSongs.firstOrNull()?.let { TopResultItem.SongItem(it) }
+
+        val finalSongsList = if (finalTop is TopResultItem.SongItem) {
+            rankedSongs.filter { it.id != finalTop.track.id }
+        } else {
+            rankedSongs
+        }
+
+        return SearchResultShelves(
+            topResult = finalTop,
+            songs = finalSongsList,
+            artists = artistsList.distinctBy { it.browseId.ifEmpty { it.name } },
+            albums = albumsList.distinctBy { it.browseId.ifEmpty { it.title } },
+            playlists = playlistsList.distinctBy { it.browseId.ifEmpty { it.title } }
+        )
+    }
+
+    private fun parseResponsiveListItem(
+        itemRenderer: JSONObject,
+        shelfTitle: String,
+        songsCandidates: MutableList<ScoredTrackCandidate>,
+        artistsList: MutableList<ArtistResult>,
+        albumsList: MutableList<AlbumResult>,
+        playlistsList: MutableList<PlaylistResult>,
+        indexProvider: () -> Int
+    ) {
+        val flexColumns = itemRenderer.optJSONArray("flexColumns") ?: return
+        if (flexColumns.length() < 2) return
+
+        val col1Runs = flexColumns.optJSONObject(0)
+            ?.optJSONObject("musicResponsiveListItemFlexColumnRenderer")
+            ?.optJSONObject("text")
+            ?.optJSONArray("runs")
+
+        val titleRun = col1Runs?.optJSONObject(0) ?: return
+        val title = titleRun.optString("text").trim().takeIf { it.isNotEmpty() } ?: return
+
+        val primaryNav = titleRun.optJSONObject("navigationEndpoint")
+            ?: itemRenderer.optJSONObject("navigationEndpoint")
+
+        val videoId = primaryNav?.optJSONObject("watchEndpoint")?.optString("videoId")
+            ?: itemRenderer.optJSONObject("playlistItemData")?.optString("videoId") ?: ""
+
+        val browseEndpoint = primaryNav?.optJSONObject("browseEndpoint")
+        val browseId = browseEndpoint?.optString("browseId") ?: ""
+        val pageType = browseEndpoint?.optJSONObject("browseEndpointContextSupportedConfigs")
+            ?.optJSONObject("browseEndpointContextMusicConfig")?.optString("pageType") ?: ""
+
+        // Aggregate ALL remaining flex columns (Column 1, Column 2, etc.) for complete metadata
+        val allRemainingRuns = JSONArray()
+        for (colIdx in 1 until flexColumns.length()) {
+            val runs = flexColumns.optJSONObject(colIdx)
+                ?.optJSONObject("musicResponsiveListItemFlexColumnRenderer")
+                ?.optJSONObject("text")
+                ?.optJSONArray("runs") ?: continue
+            for (r in 0 until runs.length()) {
+                runs.optJSONObject(r)?.let { allRemainingRuns.put(it) }
+            }
+        }
+
+        val metaInfo = parseAllColumns(allRemainingRuns)
+        val thumbUrl = extractThumbnail(itemRenderer.optJSONObject("thumbnail")?.optJSONObject("musicThumbnailRenderer"))
+
+        when (classifyEntity(pageType, browseId, metaInfo.entityType, shelfTitle)) {
+            EntityKind.ARTIST -> {
+                val validBrowseId = browseId.ifEmpty { metaInfo.artistBrowseId }
+                artistsList.add(ArtistResult(validBrowseId, title, metaInfo.subscribersText.ifEmpty { metaInfo.playCountText }, thumbUrl))
+            }
+            EntityKind.ALBUM -> {
+                val validBrowseId = browseId.ifEmpty { metaInfo.albumBrowseId }
+                albumsList.add(AlbumResult(validBrowseId, title, metaInfo.artist, metaInfo.year, thumbUrl, metaInfo.entityType.ifEmpty { "Album" }))
+            }
+            EntityKind.PLAYLIST -> {
+                val validBrowseId = browseId.ifEmpty { metaInfo.playlistBrowseId }
+                playlistsList.add(PlaylistResult(validBrowseId, title, metaInfo.author, metaInfo.trackCountText, thumbUrl))
+            }
+            EntityKind.UNKNOWN -> {
+                if (videoId.isNotEmpty() && !isInstrumentalOrKaraoke(title, metaInfo.artist)) {
+                    val track = AudioTrack(
+                        id = videoId,
+                        title = title,
+                        artist = metaInfo.artist,
+                        album = metaInfo.album,
+                        durationMs = metaInfo.durationMs,
+                        artworkUrl = thumbUrl,
+                        streamUrl = ""
+                    )
+                    val isOfficial = metaInfo.artist.contains("- topic", ignoreCase = true) ||
+                            title.contains("official audio", ignoreCase = true) ||
+                            title.contains("official music video", ignoreCase = true)
+
+                    songsCandidates.add(ScoredTrackCandidate(track, metaInfo.playCountNumeric, indexProvider(), isOfficial))
+                }
+            }
+        }
+    }
+
+    private fun classifyEntity(
+        pageType: String,
+        browseId: String,
+        entityType: String,
+        shelfTitle: String
+    ): EntityKind {
+        when (pageType) {
+            "MUSIC_PAGE_TYPE_ARTIST" -> return EntityKind.ARTIST
+            "MUSIC_PAGE_TYPE_ALBUM" -> return EntityKind.ALBUM
+            "MUSIC_PAGE_TYPE_PLAYLIST" -> return EntityKind.PLAYLIST
+        }
+
+        when {
+            browseId.startsWith("UC") -> return EntityKind.ARTIST
+            browseId.startsWith("MPREb") -> return EntityKind.ALBUM
+            browseId.startsWith("VL") || browseId.startsWith("PL") -> return EntityKind.PLAYLIST
+        }
+
+        when (entityType.lowercase(Locale.ROOT)) {
+            "artist" -> return EntityKind.ARTIST
+            "album", "single", "ep" -> return EntityKind.ALBUM
+            "playlist" -> return EntityKind.PLAYLIST
+        }
+
+        val normalizedShelf = shelfTitle.lowercase(Locale.ROOT)
+        return when {
+            normalizedShelf.contains("artist") -> EntityKind.ARTIST
+            normalizedShelf.contains("album") -> EntityKind.ALBUM
+            normalizedShelf.contains("playlist") -> EntityKind.PLAYLIST
+            else -> EntityKind.UNKNOWN
+        }
+    }
+
+    private data class SubtitleMeta(
+        val artist: String = "",
+        val artistBrowseId: String = "",
+        val album: String = "",
+        val albumBrowseId: String = "",
+        val playlistBrowseId: String = "",
+        val author: String = "",
+        val year: String = "",
+        val durationMs: Long = 0L,
+        val playCountText: String = "",
+        val playCountNumeric: Long = 0L,
+        val subscribersText: String = "",
+        val trackCountText: String = "",
+        val entityType: String = ""
+    )
+
+    private fun extractCardNavigation(card: JSONObject): JSONObject? {
+        val onTap = card.optJSONObject("onTap")
+        if (onTap != null) {
+            if (onTap.has("watchEndpoint") || onTap.has("browseEndpoint")) return onTap
+            onTap.optJSONObject("innertubeCommand")?.let { return it }
+            val commands = onTap.optJSONObject("commandExecutorCommand")?.optJSONArray("commands")
+            if (commands != null) {
+                for (i in 0 until commands.length()) {
+                    val cmd = commands.optJSONObject(i) ?: continue
+                    if (cmd.has("watchEndpoint") || cmd.has("browseEndpoint")) return cmd
+                }
+            }
+        }
+        return card.optJSONObject("title")?.optJSONArray("runs")?.optJSONObject(0)?.optJSONObject("navigationEndpoint")
     }
 
     /**
-     * Parses popularity strings from YouTube Music runs (e.g., "1.5B views", "150M plays", "800K views").
+     * Iterates over all runs across column 1, 2, and 3 to extract artist, views, duration, and labels
      */
-    fun parsePopularityViewCount(text: String): Long {
-        val lower = text.trim().lowercase()
-        if (!lower.contains("view") && !lower.contains("play") && !lower.matches(Regex("""^[\d.]+\s*[kmb]$"""))) {
-            return 0L
-        }
-        val raw = lower.replace("views", "").replace("view", "").replace("plays", "").replace("play", "").trim()
-        val multiplier = when {
-            raw.endsWith("b") -> 1_000_000_000.0
-            raw.endsWith("m") -> 1_000_000.0
-            raw.endsWith("k") -> 1_000.0
-            else -> 1.0
-        }
-        val cleanNum = raw.trimEnd('b', 'm', 'k').trim().toDoubleOrNull() ?: return 0L
-        return (cleanNum * multiplier).toLong()
-    }
+    private fun parseAllColumns(runs: JSONArray): SubtitleMeta {
+        var artist = ""
+        var artistBrowseId = ""
+        var album = ""
+        var albumBrowseId = ""
+        var playlistBrowseId = ""
+        var author = ""
+        var year = ""
+        var durationMs = 0L
+        var playCountText = ""
+        var playCountNumeric = 0L
+        var subscribersText = ""
+        var trackCountText = ""
+        var entityType = ""
 
-    private fun collectMusicResponsiveItems(node: Any?, out: MutableList<JSONObject>) {
-        when (node) {
-            is JSONObject -> {
-                if (node.has("musicResponsiveListItemRenderer")) {
-                    node.optJSONObject("musicResponsiveListItemRenderer")?.let { out.add(it) }
-                } else {
-                    val keys = node.keys()
-                    while (keys.hasNext()) {
-                        val k = keys.next()
-                        collectMusicResponsiveItems(node.opt(k), out)
+        val trackCountRegex = Regex("""^(\d+[\d,.]*)\s+(?:tracks?|songs?|videos?)$""", RegexOption.IGNORE_CASE)
+
+        for (i in 0 until runs.length()) {
+            val run = runs.optJSONObject(i) ?: continue
+            val text = run.optString("text")?.trim() ?: continue
+            if (text == "•" || text == "&" || text.isEmpty()) continue
+
+            val nav = run.optJSONObject("navigationEndpoint")
+            val browseEndpoint = nav?.optJSONObject("browseEndpoint")
+            val bId = browseEndpoint?.optString("browseId") ?: ""
+            val pageType = browseEndpoint?.optJSONObject("browseEndpointContextSupportedConfigs")
+                ?.optJSONObject("browseEndpointContextMusicConfig")?.optString("pageType") ?: ""
+
+            when {
+                trackCountRegex.matches(text) -> {
+                    trackCountText = text
+                }
+                text.equals("Song", true) || text.equals("Artist", true) ||
+                text.equals("Album", true) || text.equals("Single", true) ||
+                text.equals("EP", true) || text.equals("Playlist", true) || text.equals("Video", true) -> {
+                    if (entityType.isEmpty()) entityType = text
+                }
+                text.matches(Regex("""^\d+:\d+(?::\d+)?$""")) -> {
+                    durationMs = parseDurationToMs(text)
+                }
+                text.contains("subscriber", true) || text.contains("audience", true) -> {
+                    subscribersText = text
+                }
+                text.contains("play", true) || text.contains("view", true) -> {
+                    playCountText = text
+                    playCountNumeric = parseCountToNumeric(text)
+                }
+                text.matches(Regex("""^(19|20)\d{2}$""")) -> {
+                    year = text
+                }
+                pageType == "MUSIC_PAGE_TYPE_USER_CHANNEL" -> {
+                    if (author.isEmpty()) author = text
+                }
+                pageType == "MUSIC_PAGE_TYPE_ARTIST" || bId.startsWith("UC") -> {
+                    if (artist.isEmpty()) {
+                        artist = text
+                        artistBrowseId = bId
                     }
                 }
-            }
-            is JSONArray -> {
-                for (i in 0 until node.length()) {
-                    collectMusicResponsiveItems(node.opt(i), out)
-                }
-            }
-        }
-    }
-
-    /**
-     * Provider 1 (Waterfall Priority #1): Amazon Music HD / Ultra HD
-     * Resolves up to 24-bit / 192kHz, ~4608 kbps FLAC (Ultra HD) and 24-bit / 96kHz, 2822 kbps FLAC.
-     */
-    suspend fun searchAmazonMusic(query: String, limit: Int = 30): List<AudioTrack> = withContext(Dispatchers.IO) {
-        val results = mutableListOf<AudioTrack>()
-        try {
-            val encodedQuery = URLEncoder.encode(query.trim(), "UTF-8")
-            val url = "https://itunes.apple.com/search?term=$encodedQuery&entity=song&limit=$limit"
-            val request = Request.Builder()
-                .url(url)
-                .tag(SEARCH_CALL_TAG)
-                .header("User-Agent", "Mozilla/5.0 (Linux; Android 14; Mobile) FlowAudio/2.0")
-                .build()
-
-            val response = httpClient.newCall(request).execute()
-            if (response.isSuccessful) {
-                val bodyString = response.body?.string().orEmpty()
-                val json = JSONObject(bodyString)
-                val items = json.optJSONArray("results")
-                if (items != null) {
-                    for (i in 0 until items.length()) {
-                        val item = items.getJSONObject(i)
-                        val trackId = item.optLong("trackId", 0L)
-                        val title = item.optString("trackName", "")
-                        val artist = item.optString("artistName", "Unknown Artist")
-                        val album = item.optString("collectionName", "Single")
-                        val artwork100 = item.optString("artworkUrl100", "")
-                        val highResArtwork = AlbumArtHelper.enhanceArtworkUrl(artwork100)
-                        val genre = item.optString("primaryGenreName", "Pop")
-                        val duration = item.optLong("trackTimeMillis", 210000L).coerceAtLeast(60000L)
-                        val releaseDate = item.optString("releaseDate", "2024")
-                        val year = releaseDate.take(4).toIntOrNull() ?: 2024
-
-                        if (title.isNotBlank() && results.none {
-                                it.title.equals(title, ignoreCase = true) &&
-                                    it.artist.equals(artist, ignoreCase = true)
-                            }
-                        ) {
-                            val isUltraHd192 = i == 0 || year >= 2018 || duration >= 170_000L
-                            val fmt = AudioFormat.FLAC
-                            val sr = if (isUltraHd192) 192000 else 96000
-                            val bd = 24
-                            val br = if (sr == 192000) 4608 else 2822
-                            val sizeEst = UniversalStreamResolver.estimateFileSizeMb(duration, br)
-                            results.add(
-                                AudioTrack(
-                                    id = "amazon_$trackId",
-                                    title = title,
-                                    artist = artist,
-                                    album = album,
-                                    durationMs = duration,
-                                    format = fmt,
-                                    sampleRate = sr,
-                                    bitDepth = bd,
-                                    bitrateKbps = br,
-                                    genre = genre,
-                                    releaseYear = year,
-                                    gradientColors = listOf(0xFF00A8E1, 0xFF7928CA),
-                                    uriString = null,
-                                    artworkUrl = highResArtwork,
-                                    isGlobalOnline = true,
-                                    sourceProvider = if (sr == 192000) "Amazon Music Ultra HD" else "Amazon Music HD",
-                                    fileSizeFormatted = "$sizeEst ($br kbps ${fmt.displayName})",
-                                    lyrics = listOf(
-                                        LyricLine(2000L, "♪ $title"),
-                                        LyricLine(8000L, "♪ Performed by $artist"),
-                                        LyricLine(16000L, "♪ Album: $album"),
-                                        LyricLine(24000L, "♪ Streamed in Ultra HD FLAC")
-                                    )
-                                )
-                            )
-                        }
+                pageType == "MUSIC_PAGE_TYPE_ALBUM" || bId.startsWith("MPREb") -> {
+                    if (album.isEmpty()) {
+                        album = text
+                        albumBrowseId = bId
                     }
                 }
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-        results
-    }
-
-    /**
-     * Provider 3 (Waterfall Priority #3): Tidal HiFi / Master (FLAC / ALAC)
-     * Resolves 24-bit / 96kHz @ 2822 kbps Master FLAC/ALAC and 16-bit / 44.1kHz @ 1411 kbps HiFi FLAC.
-     */
-    suspend fun searchTidal(query: String, limit: Int = 25): List<AudioTrack> = withContext(Dispatchers.IO) {
-        val results = mutableListOf<AudioTrack>()
-        try {
-            val encodedQuery = URLEncoder.encode(query.trim(), "UTF-8")
-            val url = "https://itunes.apple.com/search?term=$encodedQuery&entity=song&limit=$limit"
-            val request = Request.Builder()
-                .url(url)
-                .tag(SEARCH_CALL_TAG)
-                .header("User-Agent", "Mozilla/5.0 (Linux; Android 14; Mobile) FlowAudio/2.0")
-                .build()
-
-            val response = httpClient.newCall(request).execute()
-            if (response.isSuccessful) {
-                val bodyString = response.body?.string().orEmpty()
-                val json = JSONObject(bodyString)
-                val items = json.optJSONArray("results")
-                if (items != null) {
-                    for (i in 0 until items.length()) {
-                        val item = items.getJSONObject(i)
-                        val trackId = item.optLong("trackId", 0L)
-                        val title = item.optString("trackName", "")
-                        val artist = item.optString("artistName", "Unknown Artist")
-                        val album = item.optString("collectionName", "Single")
-                        val artwork100 = item.optString("artworkUrl100", "")
-                        val highResArtwork = AlbumArtHelper.enhanceArtworkUrl(artwork100)
-                        val genre = item.optString("primaryGenreName", "Pop")
-                        val duration = item.optLong("trackTimeMillis", 210000L).coerceAtLeast(60000L)
-                        val releaseDate = item.optString("releaseDate", "2024")
-                        val year = releaseDate.take(4).toIntOrNull() ?: 2024
-
-                        if (title.isNotBlank() && results.none {
-                                it.title.equals(title, ignoreCase = true) &&
-                                    it.artist.equals(artist, ignoreCase = true)
-                            }
-                        ) {
-                            val isMaster = year >= 2019
-                            val fmt = if (i % 2 == 0) AudioFormat.FLAC else AudioFormat.ALAC
-                            val sr = if (isMaster) 96000 else 44100
-                            val bd = if (isMaster) 24 else 16
-                            val br = if (isMaster) 2822 else 1411
-                            val sizeEst = UniversalStreamResolver.estimateFileSizeMb(duration, br)
-                            results.add(
-                                AudioTrack(
-                                    id = "tidal_$trackId",
-                                    title = title,
-                                    artist = artist,
-                                    album = album,
-                                    durationMs = duration,
-                                    format = fmt,
-                                    sampleRate = sr,
-                                    bitDepth = bd,
-                                    bitrateKbps = br,
-                                    genre = genre,
-                                    releaseYear = year,
-                                    gradientColors = listOf(0xFF00F0FF, 0xFF1E293B),
-                                    uriString = null,
-                                    artworkUrl = highResArtwork,
-                                    isGlobalOnline = true,
-                                    sourceProvider = if (isMaster) "Tidal Master" else "Tidal HiFi",
-                                    fileSizeFormatted = "$sizeEst ($br kbps ${fmt.displayName})",
-                                    lyrics = listOf(
-                                        LyricLine(2000L, "♪ $title"),
-                                        LyricLine(8000L, "♪ Performed by $artist"),
-                                        LyricLine(16000L, "♪ Album: $album")
-                                    )
-                                )
-                            )
-                        }
-                    }
+                pageType == "MUSIC_PAGE_TYPE_PLAYLIST" || bId.startsWith("VL") || bId.startsWith("PL") -> {
+                    playlistBrowseId = bId
                 }
             }
-        } catch (e: Exception) {
-            e.printStackTrace()
         }
-        results
+
+        return SubtitleMeta(
+            artist = artist,
+            artistBrowseId = artistBrowseId,
+            album = album,
+            albumBrowseId = albumBrowseId,
+            playlistBrowseId = playlistBrowseId,
+            author = author,
+            year = year,
+            durationMs = durationMs,
+            playCountText = playCountText,
+            playCountNumeric = playCountNumeric,
+            subscribersText = subscribersText,
+            trackCountText = trackCountText,
+            entityType = entityType
+        )
     }
 
-    suspend fun searchAppleMusic(query: String, limit: Int = 30): List<AudioTrack> {
-        return searchAmazonMusic(query, limit)
+    private fun tokenize(text: String): Set<String> {
+        return text.lowercase(Locale.ROOT)
+            .split(Regex("""[^\p{L}\p{M}\p{N}]+"""))
+            .filter { it.isNotBlank() && it.length > 1 }
+            .toSet()
     }
 
-    /**
-     * Provider 2 (Waterfall Priority #2): Deezer HiFi Lossless FLAC (16-bit / 44.1kHz, 1411 kbps)
-     */
-    suspend fun searchDeezer(query: String, limit: Int = 30): List<AudioTrack> = withContext(Dispatchers.IO) {
-        val results = mutableListOf<AudioTrack>()
-        try {
-            val encodedQuery = URLEncoder.encode(query.trim(), "UTF-8")
-            val url = "https://api.deezer.com/search?q=$encodedQuery&limit=$limit"
-            val request = Request.Builder()
-                .url(url)
-                .tag(SEARCH_CALL_TAG)
-                .header("User-Agent", "FlowLossless/1.0 (Android)")
-                .build()
+    private fun rankCandidatesBalanced(candidates: List<ScoredTrackCandidate>, query: String): List<AudioTrack> {
+        val cleanQuery = query.trim().lowercase(Locale.ROOT)
+        val queryTokens = tokenize(cleanQuery)
 
-            val response = httpClient.newCall(request).execute()
-            if (response.isSuccessful) {
-                val bodyString = response.body?.string().orEmpty()
-                val json = JSONObject(bodyString)
-                val data = json.optJSONArray("data")
-                if (data != null) {
-                    for (i in 0 until data.length()) {
-                        val item = data.getJSONObject(i)
-                        val deezerId = item.optLong("id", 0L)
-                        val title = item.optString("title", "")
-                        val durationSec = item.optLong("duration", 210L).coerceAtLeast(60L)
-                        val deezerRank = item.optInt("rank", 0)
+        return candidates.sortedByDescending { item ->
+            var score = 0.0
+            val trackTitle = item.track.title.lowercase(Locale.ROOT)
+            val trackArtist = item.track.artist.lowercase(Locale.ROOT)
 
-                        val artistObj = item.optJSONObject("artist")
-                        val artistName = artistObj?.optString("name", "Unknown Artist") ?: "Unknown Artist"
+            score += (40_000.0 / (item.originalIndex + 1.0))
 
-                        val albumObj = item.optJSONObject("album")
-                        val albumTitle = albumObj?.optString("title", "Single") ?: "Single"
-                        val rawCover = albumObj?.optString("cover_xl", "")
-                            ?.ifBlank { null }
-                            ?: albumObj?.optString("cover_big", "")
-                            ?.ifBlank { null }
-                            ?: albumObj?.optString("cover_medium", "")
-                            ?: ""
-                        val coverXl = AlbumArtHelper.enhanceArtworkUrl(rawCover)
+            if (trackTitle == cleanQuery) {
+                score += 50_000.0
+            } else if (trackTitle.startsWith(cleanQuery)) {
+                score += 25_000.0
+            }
 
-                        if (title.isNotBlank() && results.none {
-                                it.title.equals(title, ignoreCase = true) &&
-                                    it.artist.equals(artistName, ignoreCase = true)
-                            }
-                        ) {
-                            val fmt = AudioFormat.FLAC
-                            val sr = 44100
-                            val bd = 16
-                            val br = 1411
-                            val sizeEst = UniversalStreamResolver.estimateFileSizeMb(durationSec * 1000L, br)
-                            results.add(
-                                AudioTrack(
-                                    id = "deezer_$deezerId",
-                                    title = title,
-                                    artist = artistName,
-                                    album = albumTitle,
-                                    durationMs = durationSec * 1000L,
-                                    format = fmt,
-                                    sampleRate = sr,
-                                    bitDepth = bd,
-                                    bitrateKbps = br,
-                                    genre = "Global Hits",
-                                    releaseYear = 2024,
-                                    gradientColors = listOf(0xFFFF007A, 0xFF7928CA),
-                                    uriString = null,
-                                    artworkUrl = coverXl,
-                                    isGlobalOnline = true,
-                                    playCount = deezerRank,
-                                    sourceProvider = "Deezer HiFi",
-                                    fileSizeFormatted = "$sizeEst ($br kbps ${fmt.displayName})",
-                                    lyrics = listOf(
-                                        LyricLine(2000L, "♪ $title"),
-                                        LyricLine(8000L, "♪ By $artistName")
-                                    )
-                                )
-                            )
-                        }
-                    }
+            val titleWords = tokenize(trackTitle)
+            val artistWords = tokenize(trackArtist)
+
+            var matchedTitleTokens = 0
+            for (token in queryTokens) {
+                if (titleWords.contains(token)) {
+                    matchedTitleTokens++
                 }
             }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-        results
+            score += (matchedTitleTokens * 4_000.0)
+
+            var matchedArtistTokens = 0
+            for (token in queryTokens) {
+                if (artistWords.contains(token)) {
+                    matchedArtistTokens++
+                }
+            }
+            score += (matchedArtistTokens * 2_500.0)
+
+            if (trackArtist.isNotEmpty() && trackArtist == cleanQuery) {
+                score += 10_000.0
+            }
+
+            if (item.playCount > 0L) {
+                val logPopularity = ln(item.playCount.toDouble() + 1.0) / ln(10.0)
+                score += (logPopularity * 1_200.0)
+            }
+
+            if (item.isOfficial) {
+                score += 2_000.0
+            }
+
+            val containsRemixQuery = queryTokens.contains("remix")
+            val containsHardstyleQuery = queryTokens.contains("hardstyle")
+            val containsCoverQuery = queryTokens.contains("cover")
+            val containsLiveQuery = queryTokens.contains("live")
+
+            if (titleWords.contains("remix") && !containsRemixQuery) score -= 6_000.0
+            if (titleWords.contains("hardstyle") && !containsHardstyleQuery) score -= 10_000.0
+            if (titleWords.contains("cover") && !containsCoverQuery) score -= 8_000.0
+            if (titleWords.contains("live") && !containsLiveQuery) score -= 4_000.0
+
+            score
+        }.map { it.track }
     }
 
-    suspend fun getGlobalTrendingTracks(): List<AudioTrack> {
-        return searchAllSources("Top Hits 2025", MusicSourceFilter.ALL, limit = 15)
+    private fun isInstrumentalOrKaraoke(title: String, artist: String): Boolean {
+        val text = "$title $artist".lowercase(Locale.ROOT)
+        val bannedTags = listOf(
+            "instrumental", "karaoke", "backing track", "minus one",
+            "no vocal", "off vocal", "piano tutorial", "guitar backing"
+        )
+        return bannedTags.any { text.contains(it) }
     }
+
+    private fun extractThumbnail(renderer: JSONObject?): String {
+        val thumbnails = renderer?.optJSONObject("thumbnail")?.optJSONArray("thumbnails") ?: return ""
+        if (thumbnails.length() == 0) return ""
+
+        var bestUrl = ""
+        var maxArea = -1
+
+        for (i in 0 until thumbnails.length()) {
+            val thumb = thumbnails.optJSONObject(i) ?: continue
+            val url = thumb.optString("url")
+            val width = thumb.optInt("width", 0)
+            val height = thumb.optInt("height", 0)
+            val area = width * height
+
+            if (area > maxArea && url.isNotEmpty()) {
+                maxArea = area
+                bestUrl = url
+            }
+        }
+
+        return if (bestUrl.isNotEmpty()) bestUrl else thumbnails.optJSONObject(thumbnails.length() - 1)?.optString("url") ?: ""
+    }
+
+    private fun extractRunsText(runs: JSONArray?): String {
+        if (runs == null || runs.length() == 0) return ""
+        val sb = StringBuilder()
+        for (i in 0 until runs.length()) {
+            sb.append(runs.optJSONObject(i)?.optString("text") ?: "")
+        }
+        return sb.toString().trim()
+    }
+
+    private fun parseCountToNumeric(text: String): Long {
+        val clean = text
+            .replace(",", "")
+            .replace(Regex("""[^0-9.KMBkmb]"""), "")
+            .uppercase(Locale.ROOT)
+
+        return try {
+            when {
+                clean.endsWith("B") -> (clean.dropLast(1).toDouble() * 1_000_000_000).toLong()
+                clean.endsWith("M") -> (clean.dropLast(1).toDouble() * 1_000_000).toLong()
+                clean.endsWith("K") -> (clean.dropLast(1).toDouble() * 1_000).toLong()
+                else -> clean.toLongOrNull() ?: 0L
+            }
+        } catch (e: NumberFormatException) {
+            0L
+        }
+    }
+
+    private fun parseDurationToMs(timeStr: String): Long {
+        val parts = timeStr.split(":").map { it.toIntOrNull() ?: 0 }
+        return when (parts.size) {
+            2 -> (parts[0] * 60L + parts[1]) * 1000L
+            3 -> (parts[0] * 3600L + parts[1] * 60L + parts[2]) * 1000L
+            else -> 0L
+        }
+    }
+
+    private fun emptyShelves() = SearchResultShelves(null, emptyList(), emptyList(), emptyList(), emptyList())
 }
